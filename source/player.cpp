@@ -1,0 +1,913 @@
+// Video player: libmpv rendering through OpenGL into the same SDL_Window.
+// The UI's SDL_Renderer is destroyed before (App::run) and recreated afterwards, so the player's
+// controls are drawn by mpv itself as an ASS overlay (osd-overlay), streaming-service style.
+
+#include <mpv/client.h>
+#include <mpv/render_gl.h>
+#include <mpv/stream_cb.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <ctime>
+#include <vector>
+
+#include "app.hpp"
+#include "http.hpp"
+#include "log.hpp"
+
+namespace {
+
+void* getProcAddress(void*, const char* name) {
+    return SDL_GL_GetProcAddress(name);
+}
+
+SDL_GLContext createContext(SDL_Window* win) {
+    SDL_GL_ResetAttributes();
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GLContext ctx = SDL_GL_CreateContext(win);
+    if (ctx) return ctx;
+    logMsg("GL 3.3 core failed (%s), trying GLES 3", SDL_GetError());
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    return SDL_GL_CreateContext(win);
+}
+
+void setOpt(mpv_handle* mpv, const char* name, const char* value) {
+    int rc = mpv_set_option_string(mpv, name, value);
+    if (rc < 0) logMsg("mpv: option %s=%s ignored (%s)", name, value, mpv_error_string(rc));
+}
+
+void command(mpv_handle* mpv, const char* a, const char* b = nullptr, const char* c = nullptr) {
+    const char* args[] = {a, b, c, nullptr};
+    mpv_command_async(mpv, 0, args);
+}
+
+double propDouble(mpv_handle* mpv, const char* name, double def = 0) {
+    double v = def;
+    if (mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &v) < 0) return def;
+    return v;
+}
+
+int64_t propInt(mpv_handle* mpv, const char* name, int64_t def = 0) {
+    int64_t v = def;
+    if (mpv_get_property(mpv, name, MPV_FORMAT_INT64, &v) < 0) return def;
+    return v;
+}
+
+bool propFlag(mpv_handle* mpv, const char* name) {
+    int v = 0;
+    mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &v);
+    return v != 0;
+}
+
+std::string propString(mpv_handle* mpv, const std::string& name) {
+    char* s = mpv_get_property_string(mpv, name.c_str());
+    std::string out = s ? s : "";
+    if (s) mpv_free(s);
+    return out;
+}
+
+std::string clock(double s) {
+    if (s < 0 || std::isnan(s)) s = 0;
+    int t = (int)s;
+    char buf[32];
+    if (t >= 3600)
+        snprintf(buf, sizeof(buf), "%d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60);
+    else
+        snprintf(buf, sizeof(buf), "%d:%02d", t / 60, t % 60);
+    return buf;
+}
+
+// ---------------------------------------------------------------- torrent:// protocol
+
+struct TorrentCookie {
+    std::shared_ptr<Torrent> t;
+    int64_t pos = 0;
+    std::atomic<bool> cancel{false};
+};
+
+int64_t torrentRead(void* c, char* buf, uint64_t n) {
+    auto* s = static_cast<TorrentCookie*>(c);
+    int64_t r = s->t->read(s->pos, buf, (int64_t)n, s->cancel);
+    if (r > 0) s->pos += r;
+    return r;
+}
+
+int64_t torrentSeek(void* c, int64_t off) {
+    auto* s = static_cast<TorrentCookie*>(c);
+    if (off < 0 || off > s->t->fileSize()) return MPV_ERROR_GENERIC;
+    s->pos = off;
+    return off;
+}
+
+int64_t torrentSize(void* c) {
+    return static_cast<TorrentCookie*>(c)->t->fileSize();
+}
+
+void torrentClose(void* c) {
+    delete static_cast<TorrentCookie*>(c);
+}
+
+void torrentCancel(void* c) {
+    static_cast<TorrentCookie*>(c)->cancel = true;
+}
+
+int torrentOpen(void* userData, char*, mpv_stream_cb_info* info) {
+    auto* torrent = static_cast<std::shared_ptr<Torrent>*>(userData);
+    if (!*torrent || !(*torrent)->hasMetadata()) return MPV_ERROR_LOADING_FAILED;
+    auto* c = new TorrentCookie;
+    c->t = *torrent;
+    info->cookie = c;
+    info->read_fn = torrentRead;
+    info->seek_fn = torrentSeek;
+    info->size_fn = torrentSize;
+    info->close_fn = torrentClose;
+    info->cancel_fn = torrentCancel;
+    return 0;
+}
+
+std::string torrentLine(Torrent& t) {
+    TorrentStatus st = t.status();
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%d peers  ·  %.1f MB/s  ·  %.0f MB downloaded", st.peersConnected,
+             st.speed / (1024 * 1024), (double)st.downloaded / (1024 * 1024));
+    return buf;
+}
+
+// ---------------------------------------------------------------- ASS drawing
+
+// Builds "ass-events" for osd-overlay on a 1280x720 canvas.
+class Ass {
+public:
+    explicit Ass(const std::string& font) : fn(font) {}
+    std::string out;
+
+    static std::string bgr(Color c) {
+        char b[16];
+        snprintf(b, sizeof(b), "&H%02X%02X%02X&", c.b, c.g, c.r);
+        return b;
+    }
+    static std::string alpha(Uint8 a) {  // ASS alpha is inverted: 00 opaque, FF transparent
+        char b[8];
+        snprintf(b, sizeof(b), "&H%02X&", 255 - a);
+        return b;
+    }
+
+    void shape(const std::string& path, Color c) {
+        out += "{\\an7\\pos(0,0)\\bord0\\shad0\\1c" + bgr(c) + "\\1a" + alpha(c.a) + "\\p1}" + path + "{\\p0}\n";
+    }
+
+    void rect(float x, float y, float w, float h, Color c) {
+        char b[160];
+        snprintf(b, sizeof(b), "m %.1f %.1f l %.1f %.1f %.1f %.1f %.1f %.1f", x, y, x + w, y, x + w, y + h, x, y + h);
+        shape(b, c);
+    }
+
+    void roundRect(float x, float y, float w, float h, float r, Color c) {
+        r = std::min(r, std::min(w, h) / 2);
+        const float k = 0.4477f * r;  // control-point inset for a circular corner
+        char b[512];
+        snprintf(b, sizeof(b),
+                 "m %.1f %.1f l %.1f %.1f b %.1f %.1f %.1f %.1f %.1f %.1f l %.1f %.1f b %.1f %.1f %.1f %.1f %.1f %.1f "
+                 "l %.1f %.1f b %.1f %.1f %.1f %.1f %.1f %.1f l %.1f %.1f b %.1f %.1f %.1f %.1f %.1f %.1f",
+                 x + r, y, x + w - r, y, x + w - k, y, x + w, y + k, x + w, y + r, x + w, y + h - r, x + w, y + h - k,
+                 x + w - k, y + h, x + w - r, y + h, x + r, y + h, x + k, y + h, x, y + h - k, x, y + h - r, x, y + r, x,
+                 y + k, x + k, y, x + r, y);
+        shape(b, c);
+    }
+
+    void circle(float cx, float cy, float r, Color c) { roundRect(cx - r, cy - r, 2 * r, 2 * r, r, c); }
+
+    void poly(std::initializer_list<float> pts, Color c) {
+        std::string p;
+        char b[32];
+        size_t i = 0;
+        for (auto it = pts.begin(); it != pts.end(); it += 2, i++) {
+            snprintf(b, sizeof(b), "%s %.1f %.1f ", i == 0 ? "m" : (i == 1 ? "l" : ""), *it, *(it + 1));
+            p += b;
+        }
+        shape(p, c);
+    }
+
+    void gradientV(float y, float h, Color c, Uint8 a0, Uint8 a1, int steps = 18) {
+        float sh = h / steps;
+        for (int i = 0; i < steps; i++) {
+            float t = (i + 0.5f) / steps;
+            rect(0, y + i * sh, 1280, sh + 0.6f, c.alpha((Uint8)(a0 + (a1 - a0) * t)));
+        }
+    }
+
+    // an: ASS numpad alignment of (x, y): 7 top-left, 4 middle-left, 5 center, 6 middle-right, 9 top-right...
+    void text(float x, float y, int size, Color c, int an, const std::string& s, bool shadow = true) {
+        char b[256];
+        snprintf(b, sizeof(b), "{\\an%d\\pos(%.1f,%.1f)\\fs%d\\bord0\\shad%d\\4c&H000000&\\4a&H90&\\1c%s\\1a%s", an, x,
+                 y, size, shadow ? 1 : 0, bgr(c).c_str(), alpha(c.a).c_str());
+        out += b;
+        if (!fn.empty()) out += "\\fn" + fn;
+        out += "}" + escape(s) + "\n";
+    }
+
+    void pill(float x, float cy, const std::string& key) {  // controller button hint
+        float w = std::max(28.0f, key.size() * 12.0f + 14);
+        roundRect(x, cy - 14, w, 28, 14, col::white.alpha(50));
+        text(x + w / 2, cy, 17, col::white, 5, key, false);
+    }
+
+    void spinner(float cx, float cy, float r) {
+        const int dots = 10;
+        float base = (float)(SDL_GetTicks() % 1000) / 1000.0f * dots;
+        for (int i = 0; i < dots; i++) {
+            float a = (float)i / dots * 2 * (float)M_PI;
+            float age = std::fmod(base - i + dots, (float)dots) / dots;
+            circle(cx + std::cos(a) * r, cy + std::sin(a) * r, r * 0.16f,
+                   col::accentLight.alpha((Uint8)(255 * (1.0f - age * 0.85f))));
+        }
+    }
+
+    void playIcon(float x, float cy, float s, Color c) { poly({x, cy - s, x, cy + s, x + s * 1.7f, cy}, c); }
+    void pauseIcon(float x, float cy, float s, Color c) {
+        rect(x, cy - s, s * 0.6f, s * 2, c);
+        rect(x + s, cy - s, s * 0.6f, s * 2, c);
+    }
+
+private:
+    std::string fn;
+    static std::string escape(const std::string& s) {
+        std::string o;
+        for (char ch : s) {
+            if (ch == '{') o += '(';
+            else if (ch == '}') o += ')';
+            else if (ch == '\\') o += '/';
+            else if (ch == '\n') o += "\\N";
+            else o += ch;
+        }
+        return o;
+    }
+};
+
+struct Track {
+    int64_t id = 0;
+    std::string label;
+    bool selected = false;
+};
+
+std::vector<Track> loadTracks(mpv_handle* mpv, const std::string& type) {
+    std::vector<Track> out;
+    int64_t n = propInt(mpv, "track-list/count");
+    for (int64_t i = 0; i < n; i++) {
+        std::string p = "track-list/" + std::to_string(i) + "/";
+        if (propString(mpv, p + "type") != type) continue;
+        Track t;
+        t.id = propInt(mpv, (p + "id").c_str());
+        std::string lang = propString(mpv, p + "lang"), title = propString(mpv, p + "title");
+        std::string codec = propString(mpv, p + "codec");
+        t.label = !title.empty() ? title : !lang.empty() ? lang : "Track " + std::to_string(t.id);
+        if (!lang.empty() && !title.empty() && title.find(lang) == std::string::npos) t.label += "  (" + lang + ")";
+        if (type == "audio" && !codec.empty()) t.label += "  ·  " + codec;
+        t.selected = propString(mpv, p + "selected") == "yes";
+        out.push_back(t);
+    }
+    return out;
+}
+
+struct SubFile {
+    std::string path, title, lang;
+};
+
+// Asks every subtitles addon, keeps the preferred language and downloads up to 6 files to the SD
+// card (mpv then loads them like local files, so no TLS is needed inside mpv).
+std::vector<SubFile> fetchAddonSubs(const std::vector<Addon>& addons, const std::string& type,
+                                    const std::string& videoId, const std::string& langCode) {
+    const SubLanguage& lang = subLanguage(langCode);
+    std::vector<SubtitleTrack> found;
+    for (auto& a : addons) {
+        std::string err;
+        for (auto& t : fetchSubtitles(a, type, videoId, err))
+            if (subLangMatches(lang, t.lang)) found.push_back(t);
+    }
+    ensureDir(APP_DIR "/subs");
+    std::vector<SubFile> out;
+    std::vector<std::string> seen;
+    for (auto& t : found) {
+        if (out.size() >= 6) break;
+        if (std::find(seen.begin(), seen.end(), t.url) != seen.end()) continue;
+        seen.push_back(t.url);
+        std::string body, err;
+        if (!httpGet(t.url, body, err, 20) || body.size() < 16) continue;
+        std::string low = t.url;
+        for (auto& c : low) c = (char)tolower((unsigned char)c);
+        const char* ext = low.find(".vtt") != std::string::npos   ? ".vtt"
+                          : low.find(".ass") != std::string::npos ? ".ass"
+                          : low.find(".ssa") != std::string::npos ? ".ssa"
+                                                                  : ".srt";
+        SubFile f;
+        f.path = std::string(APP_DIR "/subs/sub_") + std::to_string(out.size()) + ext;
+        if (!writeFile(f.path, body.data(), body.size())) continue;
+        f.title = std::string(lang.label) + "  ·  " + t.addonName + " " + std::to_string(out.size() + 1);
+        f.lang = t.lang;
+        out.push_back(f);
+    }
+    logMsg("subtitles: %zu found in %s, %zu downloaded", found.size(), lang.label, out.size());
+    return out;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------- player
+
+PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, double startAt) {
+    PlayResult res;
+    SDL_Window* win = app.win;
+    std::string font = app.gfx.fontFamily();
+    SDL_GLContext gl = createContext(win);
+    if (!gl) {
+        res.error = std::string("SDL_GL_CreateContext: ") + SDL_GetError();
+        return res;
+    }
+    SDL_GL_MakeCurrent(win, gl);
+    SDL_GL_SetSwapInterval(1);
+
+    mpv_handle* mpv = mpv_create();
+    if (!mpv) {
+        SDL_GL_DeleteContext(gl);
+        res.error = "mpv_create failed";
+        return res;
+    }
+    setOpt(mpv, "vo", "libmpv");
+    setOpt(mpv, "hwdec", "auto");
+    setOpt(mpv, "cache", "yes");
+    setOpt(mpv, "demuxer-max-bytes", "48MiB");
+    setOpt(mpv, "demuxer-max-back-bytes", "8MiB");
+    setOpt(mpv, "network-timeout", "30");
+    setOpt(mpv, "user-agent", "StremNX/0.3");
+    setOpt(mpv, "keep-open", "no");
+    setOpt(mpv, "volume-max", "200");
+    setOpt(mpv, "osd-level", "1");
+    setOpt(mpv, "osd-bar", "no");
+    setOpt(mpv, "osd-on-seek", "no");
+    // Subtitle preferences from Settings
+    const Config& cfg = app.cfg;
+    const SubLanguage& subLang = subLanguage(cfg.subLang);
+    std::string slang;
+    for (auto& m : subLang.match) slang += (slang.empty() ? "" : ",") + m;
+    if (slang.empty())
+        setOpt(mpv, "sid", "no");
+    else
+        setOpt(mpv, "slang", slang.c_str());
+    setOpt(mpv, "alang", "en,eng,ja,jpn");
+    setOpt(mpv, "sub-fonts-dir", APP_DIR "/fonts");
+    setOpt(mpv, "osd-fonts-dir", APP_DIR "/fonts");
+    setOpt(mpv, "sub-font-size", "46");
+    setOpt(mpv, "sub-border-size", "2.5");
+    char num[32];
+    snprintf(num, sizeof(num), "%.2f", cfg.subSize / 100.0);
+    setOpt(mpv, "sub-scale", num);
+    setOpt(mpv, "sub-pos", std::to_string(cfg.subPos).c_str());
+    setOpt(mpv, "sub-color", cfg.subColor ? "#FFE600" : "#FFFFFF");
+    if (cfg.subStyle == 1) {
+        if (mpv_set_option_string(mpv, "sub-border-style", "background-box") < 0)
+            setOpt(mpv, "sub-border-style", "opaque-box");
+        setOpt(mpv, "sub-back-color", "#C0000000");
+    }
+    snprintf(num, sizeof(num), "%.3f", cfg.subDelayMs / 1000.0);
+    setOpt(mpv, "sub-delay", num);
+    if (!font.empty()) {
+        setOpt(mpv, "osd-font", font.c_str());
+        setOpt(mpv, "sub-font", font.c_str());
+    }
+    setOpt(mpv, "force-media-title", ctx.name.c_str());
+    if (startAt > 0) setOpt(mpv, "start", std::to_string((int)startAt).c_str());
+    mpv_request_log_messages(mpv, "warn");
+
+    if (mpv_initialize(mpv) < 0) {
+        mpv_terminate_destroy(mpv);
+        SDL_GL_DeleteContext(gl);
+        res.error = "mpv_initialize failed";
+        return res;
+    }
+    const bool isTorrent = url.compare(0, 10, "torrent://") == 0 && app.activeTorrent;
+    if (isTorrent) mpv_stream_cb_add_ro(mpv, "torrent", &app.activeTorrent, torrentOpen);
+
+    mpv_opengl_init_params glInit{getProcAddress, nullptr};
+    mpv_render_param params[] = {
+        {MPV_RENDER_PARAM_API_TYPE, const_cast<char*>(MPV_RENDER_API_TYPE_OPENGL)},
+        {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &glInit},
+        {MPV_RENDER_PARAM_INVALID, nullptr},
+    };
+    mpv_render_context* rctx = nullptr;
+    if (mpv_render_context_create(&rctx, mpv, params) < 0) {
+        mpv_terminate_destroy(mpv);
+        SDL_GL_DeleteContext(gl);
+        res.error = "mpv_render_context_create failed";
+        return res;
+    }
+
+    appletSetMediaPlaybackState(true);  // keep the console from sleeping during playback
+    command(mpv, "loadfile", url.c_str());
+
+    // Subtitles from addons (OpenSubtitles...): fetched and downloaded in the background, then added
+    // to mpv once the file is loaded.
+    Task<std::vector<SubFile>> subsTask;
+    if (cfg.subAddons && !slang.empty() && !ctx.videoId.empty()) {
+        std::string type = ctx.type.empty() ? "movie" : ctx.type, vid = ctx.videoId, code = cfg.subLang;
+        std::vector<Addon> cands;
+        for (auto& a : app.addons)
+            if (addonSupports(a, "subtitles", type, vid)) cands.push_back(a);
+        if (!cands.empty()) subsTask.start([cands, type, vid, code]() { return fetchAddonSubs(cands, type, vid, code); });
+    }
+    bool fileLoaded = false;
+    double subDelay = cfg.subDelayMs / 1000.0, subScale = cfg.subSize / 100.0;
+    std::vector<SubFile> addedSubs;  // re-added after a reconnect
+
+    // UI state
+    bool quit = false, started = false;
+    uint32_t lastInput = SDL_GetTicks(), lastProps = 0, lastDraw = 0;
+    double pos = startAt, dur = 0, cacheAhead = 0;
+    bool paused = false, buffering = false;
+    int64_t bufferPct = 0;
+    std::string flash;  // "+10s", "Subtitles off"...
+    bool flashRight = true;
+    uint32_t flashAt = 0;
+    int seekAcc = 0;
+    std::string lastSubId = "auto";
+    std::string lastAss;
+
+    // Menu: 0 audio, 1 subtitles, 2 playback options
+    bool menuOpen = false;
+    int menuCol = 0, menuSel[3] = {0, 0, 0};
+    std::vector<Track> audio, subs;
+    static const double speeds[] = {0.5, 0.75, 1.0, 1.25, 1.5, 2.0};
+    static const char* aspects[] = {"Auto", "16:9", "4:3", "2.35:1", "Fill screen"};
+    static const double zooms[] = {0, 0.1, 0.2, 0.3};
+    static const char* zoomNames[] = {"Off", "+7%", "+15%", "+23%"};
+    static const int volumes[] = {100, 125, 150, 200};
+    int speedIdx = 2, aspectIdx = 0, zoomIdx = 0, volumeIdx = 0;
+
+    // Up next (series)
+    std::string nextId = !ctx.nextVideoId.empty() ? ctx.nextVideoId : guessNextEpisode(ctx.videoId, false);
+    std::string nextLabel = !ctx.nextEpisodeLabel.empty() ? ctx.nextEpisodeLabel : episodeLabelFromId(nextId);
+    bool upNextOn = ctx.type == "series" && cfg.autoplayNext && !nextId.empty();
+    bool upShown = false, upCancelled = false;
+    uint32_t upShownAt = 0;
+
+    // Reconnecting after sleep / network drops
+    int retries = 0;
+    bool reconnecting = false;
+    uint32_t reconnectAt = 0;
+    int64_t lastWall = (int64_t)time(nullptr);
+
+    auto openMenu = [&]() {
+        audio = loadTracks(mpv, "audio");
+        subs = loadTracks(mpv, "sub");
+        Track off;
+        off.id = -1;
+        off.label = "Off";
+        off.selected = std::none_of(subs.begin(), subs.end(), [](const Track& t) { return t.selected; });
+        subs.insert(subs.begin(), off);
+        menuSel[0] = menuSel[1] = menuSel[2] = 0;
+        for (int i = 0; i < (int)audio.size(); i++)
+            if (audio[i].selected) menuSel[0] = i;
+        for (int i = 0; i < (int)subs.size(); i++)
+            if (subs[i].selected) menuSel[1] = i;
+        menuCol = audio.empty() ? 1 : 0;
+        menuOpen = true;
+    };
+
+    auto optionLabel = [&](int i) -> std::string {
+        char b[48];
+        switch (i) {
+            case 0: snprintf(b, sizeof(b), "Speed: %gx", speeds[speedIdx]); return b;
+            case 1: return std::string("Aspect: ") + aspects[aspectIdx];
+            case 2: return std::string("Zoom: ") + zoomNames[zoomIdx];
+            default: snprintf(b, sizeof(b), "Volume: %d%%", volumes[volumeIdx]); return b;
+        }
+    };
+
+    auto changeOption = [&](int i, int dir) {
+        switch (i) {
+            case 0: {
+                speedIdx = (speedIdx + dir + 6) % 6;
+                double v = speeds[speedIdx];
+                mpv_set_property(mpv, "speed", MPV_FORMAT_DOUBLE, &v);
+                break;
+            }
+            case 1: {
+                aspectIdx = (aspectIdx + dir + 5) % 5;
+                double pan = aspectIdx == 4 ? 1.0 : 0.0;  // "fill" crops the sides instead of letterboxing
+                mpv_set_property(mpv, "panscan", MPV_FORMAT_DOUBLE, &pan);
+                mpv_set_property_string(mpv, "video-aspect-override", aspectIdx == 0 || aspectIdx == 4 ? "no" : aspects[aspectIdx]);
+                break;
+            }
+            case 2: {
+                zoomIdx = (zoomIdx + dir + 4) % 4;
+                double z = zooms[zoomIdx];
+                mpv_set_property(mpv, "video-zoom", MPV_FORMAT_DOUBLE, &z);
+                break;
+            }
+            case 3: {
+                volumeIdx = (volumeIdx + dir + 4) % 4;
+                double v = volumes[volumeIdx];
+                mpv_set_property(mpv, "volume", MPV_FORMAT_DOUBLE, &v);
+                break;
+            }
+        }
+    };
+
+    auto applyTrack = [&](int col, int idx) {
+        std::vector<Track>& list = col == 0 ? audio : subs;
+        if (idx < 0 || idx >= (int)list.size()) return;
+        Track& t = list[idx];
+        std::string id = t.id < 0 ? "no" : std::to_string(t.id);
+        mpv_set_property_string(mpv, col == 0 ? "aid" : "sid", id.c_str());
+        for (auto& x : list) x.selected = &x == &t;
+        if (col == 1 && t.id >= 0) lastSubId = id;
+    };
+
+    auto seekBy = [&](int secs) {
+        uint32_t now = SDL_GetTicks();
+        bool chain = now - flashAt < 900 && ((secs > 0) == flashRight) && !flash.empty() && flash[0] != 'S';
+        seekAcc = chain ? seekAcc + secs : secs;
+        std::string s = std::to_string(secs);
+        command(mpv, "seek", s.c_str());
+        flash = (seekAcc > 0 ? "+" : "") + std::to_string(seekAcc) + "s";
+        flashRight = secs > 0;
+        flashAt = now;
+    };
+
+    // Menu geometry (shared by drawing and touch)
+    const float colX[3] = {130, 520, 910};
+    auto menuItemY = [](int i, int first) { return 210.0f + (i - first) * 44; };
+    auto menuFirst = [&](int c) { return std::max(0, menuSel[c] - 8); };
+    auto menuCount = [&](int c) { return c == 0 ? (int)audio.size() : c == 1 ? (int)subs.size() : 4; };
+
+    while (!quit && appletMainLoop()) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e))
+            if (e.type == SDL_QUIT) quit = true;
+
+        Input& in = app.in;
+        in.update();
+        uint32_t now = SDL_GetTicks();
+
+        // Back from sleep / HOME menu: pause, and let network users reconnect.
+        int64_t wall = (int64_t)time(nullptr);
+        if (wall - lastWall > 5) {
+            app.onResume();
+            command(mpv, "set", "pause", "yes");
+            flash = "Paused while the console was asleep";
+            flashAt = now;
+            lastInput = now;
+        }
+        lastWall = wall;
+
+        bool anyInput = in.pressed(K_A | K_B | K_X | K_Y | K_UP | K_DOWN | K_LEFT | K_RIGHT | K_ZL | K_ZR | K_L |
+                                   K_R | K_MINUS | K_PLUS);
+        int tx = 0, ty = 0;
+        bool tap = in.tap(tx, ty);
+        bool controlsVisible = now - lastInput < 4000 || paused;
+        if (anyInput || tap) lastInput = now;
+
+        if (menuOpen) {
+            if (tap) {  // touch: pick an item, or tap outside the columns to close
+                bool hitItem = false;
+                for (int c = 0; c < 3; c++) {
+                    if (tx < colX[c] - 20 || tx > colX[c] + 340) continue;
+                    int first = menuFirst(c);
+                    for (int i = first; i < menuCount(c) && i < first + 10; i++) {
+                        float y = menuItemY(i, first);
+                        if (ty >= y - 6 && ty < y + 38) {
+                            menuCol = c;
+                            menuSel[c] = i;
+                            if (c == 2) changeOption(i, 1);
+                            else applyTrack(c, i);
+                            hitItem = true;
+                        }
+                    }
+                }
+                if (!hitItem && ty > 140 && ty < 620) menuOpen = false;
+            }
+            if (in.pressed(K_B) || in.pressed(K_X)) menuOpen = false;
+            if (in.pressed(K_LEFT) && menuCol > 0) menuCol = menuCol == 1 && audio.empty() ? 1 : menuCol - 1;
+            if (in.pressed(K_RIGHT) && menuCol < 2) menuCol++;
+            if (in.pressed(K_UP) && menuSel[menuCol] > 0) menuSel[menuCol]--;
+            if (in.pressed(K_DOWN) && menuSel[menuCol] + 1 < menuCount(menuCol)) menuSel[menuCol]++;
+            if (in.pressed(K_A)) {
+                if (menuCol == 2) changeOption(menuSel[2], 1);
+                else applyTrack(menuCol, menuSel[menuCol]);
+            }
+            if (in.pressed(K_Y) && menuCol == 2) changeOption(menuSel[2], -1);
+        } else if (upShown) {  // "Up next" card takes A / B
+            bool playNow = in.pressed(K_A) || (tap && tx >= 880 && tx < 1050 && ty >= 560 && ty < 610);
+            bool cancel = in.pressed(K_B) || (tap && tx >= 1060 && tx < 1210 && ty >= 560 && ty < 610);
+            if (playNow) {
+                res.playNext = true;
+                quit = true;
+            } else if (cancel) {
+                upShown = false;
+                upCancelled = true;
+            }
+        } else {
+            if (in.pressed(K_B) || in.pressed(K_PLUS)) quit = true;
+            if (in.pressed(K_A)) command(mpv, "cycle", "pause");
+            if (in.pressed(K_LEFT)) seekBy(-10);
+            if (in.pressed(K_RIGHT)) seekBy(10);
+            if (in.pressed(K_ZL)) seekBy(-60);
+            if (in.pressed(K_ZR)) seekBy(60);
+            if (in.pressed(K_X)) openMenu();
+            if (in.pressed(K_Y)) {
+                std::string sid = propString(mpv, "sid");
+                bool off = sid == "no" || sid.empty();
+                mpv_set_property_string(mpv, "sid", off ? lastSubId.c_str() : "no");
+                if (!off) lastSubId = sid;
+                flash = off ? "Subtitles on" : "Subtitles off";
+                flashAt = now;
+            }
+            if (in.pressed(K_MINUS)) command(mpv, "script-binding", "stats/display-stats-toggle");
+
+            // Touch: first tap shows the controls; then the bar seeks, the sides skip, the middle pauses.
+            if (tap && controlsVisible && started) {
+                if (ty < 120 && tx < 420) {
+                    quit = true;  // title / back area
+                } else if (ty >= 640 && tx >= 840 && tx < 1080) {
+                    openMenu();
+                } else if (ty >= 595 && ty < 640 && tx >= 50 && tx < 1130 && dur > 0) {
+                    std::string to = std::to_string((int)(dur * std::max(0.0, std::min(1.0, (tx - 60) / 1060.0))));
+                    const char* args[] = {"seek", to.c_str(), "absolute", nullptr};
+                    mpv_command_async(mpv, 0, args);
+                } else if (ty >= 140 && ty < 590) {
+                    if (tx < 400) seekBy(-10);
+                    else if (tx > 880) seekBy(10);
+                    else command(mpv, "cycle", "pause");
+                }
+            }
+        }
+
+        // Subtitle timing (L/R, also inside the menu) and size (ZL/ZR inside the menu)
+        if (in.pressed(K_L) || in.pressed(K_R)) {
+            subDelay += (in.pressed(K_R) ? 1 : -1) * cfg.subStepMs / 1000.0;
+            if (std::fabs(subDelay) < 0.001) subDelay = 0;
+            mpv_set_property(mpv, "sub-delay", MPV_FORMAT_DOUBLE, &subDelay);
+            char b[48];
+            snprintf(b, sizeof(b), "Subtitle delay %+.2f s", subDelay);
+            flash = b;
+            flashAt = now;
+        }
+        if (menuOpen && (in.pressed(K_ZL) || in.pressed(K_ZR))) {
+            subScale = std::max(0.5, std::min(2.5, subScale + (in.pressed(K_ZR) ? 0.1 : -0.1)));
+            mpv_set_property(mpv, "sub-scale", MPV_FORMAT_DOUBLE, &subScale);
+        }
+
+        // Addon subtitles arrived: add them, and pick one if nothing in the preferred language is on.
+        if (fileLoaded && subsTask.ready()) {
+            std::vector<SubFile> files = subsTask.take();
+            std::string cur = propString(mpv, "current-tracks/sub/lang");
+            bool select = cur.empty() || !subLangMatches(subLang, cur);
+            for (size_t i = 0; i < files.size(); i++) {
+                const char* args[] = {"sub-add", files[i].path.c_str(), i == 0 && select ? "select" : "auto",
+                                      files[i].title.c_str(), files[i].lang.c_str(), nullptr};
+                mpv_command_async(mpv, 0, args);
+            }
+            addedSubs = files;
+            if (!files.empty() && select) {
+                flash = "Subtitles: " + files[0].title;
+                flashAt = now;
+            }
+        }
+
+        for (;;) {
+            mpv_event* ev = mpv_wait_event(mpv, 0);
+            if (ev->event_id == MPV_EVENT_NONE) break;
+            if (ev->event_id == MPV_EVENT_SHUTDOWN) quit = true;
+            if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) started = true;
+            if (ev->event_id == MPV_EVENT_FILE_LOADED) {
+                fileLoaded = true;
+                if (retries > 0)  // a reconnect reloaded the file: put the addon subtitles back
+                    for (auto& f : addedSubs) {
+                        const char* args[] = {"sub-add", f.path.c_str(), "auto", f.title.c_str(), f.lang.c_str(), nullptr};
+                        mpv_command_async(mpv, 0, args);
+                    }
+            }
+            if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
+                auto* m = static_cast<mpv_event_log_message*>(ev->data);
+                logMsg("mpv [%s] %s: %s", m->level, m->prefix, m->text);
+            }
+            if (ev->event_id == MPV_EVENT_END_FILE) {
+                auto* ef = static_cast<mpv_event_end_file*>(ev->data);
+                if (ef->reason == MPV_END_FILE_REASON_ERROR) {
+                    if (started && retries < 3) {  // dropped connection (sleep, Wi-Fi): reload where we were
+                        retries++;
+                        reconnecting = true;
+                        reconnectAt = now + 1500 * retries;
+                        started = false;
+                        logMsg("player: playback error (%s), reconnecting (%d)", mpv_error_string(ef->error), retries);
+                        continue;
+                    }
+                    res.error = mpv_error_string(ef->error);
+                }
+                if (ef->reason == MPV_END_FILE_REASON_EOF) {
+                    res.ended = true;
+                    if (upNextOn && !upCancelled) res.playNext = true;
+                }
+                if (ef->reason != MPV_END_FILE_REASON_STOP || !reconnecting) quit = true;
+            }
+        }
+        if (reconnecting && now >= reconnectAt) {
+            reconnecting = false;
+            std::string at = std::to_string((int)pos);
+            mpv_set_property_string(mpv, "start", at.c_str());
+            command(mpv, "loadfile", url.c_str());
+        }
+
+        if (now - lastProps > 100) {
+            lastProps = now;
+            pos = propDouble(mpv, "time-pos", pos);
+            dur = propDouble(mpv, "duration", dur);
+            paused = propFlag(mpv, "pause");
+            buffering = propFlag(mpv, "paused-for-cache") || propFlag(mpv, "seeking");
+            bufferPct = propInt(mpv, "cache-buffering-state", 0);
+            cacheAhead = propDouble(mpv, "demuxer-cache-time", pos) - pos;
+        }
+
+        // Up next: the card appears in the last 20 s and counts down from 10.
+        if (upNextOn && !upCancelled && !upShown && started && dur > 60 && dur - pos <= 20 && !menuOpen) {
+            upShown = true;
+            upShownAt = now;
+        }
+        int countdown = upShown ? 10 - (int)((now - upShownAt) / 1000) : 10;
+        if (upShown && countdown <= 0) {
+            res.playNext = true;
+            quit = true;
+        }
+
+        // ------------------------------------------------ overlay
+        if (now - lastDraw > 66) {
+            lastDraw = now;
+            bool controls = now - lastInput < 4000 || paused;
+            bool showFlash = !flash.empty() && now - flashAt < 900;
+            if (flash.size() > 12 && flash.compare(0, 12, "Paused while") == 0) showFlash = now - flashAt < 3000;
+            Ass a(font);
+            if (!started) {
+                // Loading screen
+                a.rect(0, 0, 1280, 720, col::black.alpha(255));
+                a.text(640, 300, 40, col::white, 5, ctx.name);
+                if (!ctx.episodeLabel.empty()) a.text(640, 350, 24, col::dim, 5, ctx.episodeLabel);
+                a.spinner(640, 430, 26);
+                std::string sub = retries > 0 ? "Reconnecting..." : startAt > 0 ? "Resuming at " + clock(startAt) : "Loading";
+                a.text(640, 492, 22, col::dim, 5, sub);
+                if (isTorrent) a.text(640, 530, 19, col::faint, 5, torrentLine(*app.activeTorrent));
+                a.text(640, 670, 18, col::faint, 5, "B  Cancel");
+            } else if (menuOpen) {
+                a.rect(0, 0, 1280, 720, col::black.alpha(205));
+                const char* heads[3] = {"Audio", "Subtitles", "Playback"};
+                for (int c = 0; c < 3; c++) {
+                    a.text(colX[c], 140, 32, c == menuCol ? col::white : col::dim, 7, heads[c]);
+                    int first = menuFirst(c), n = menuCount(c);
+                    for (int i = first; i < n && i < first + 10; i++) {
+                        float y = menuItemY(i, first);
+                        bool focused = c == menuCol && i == menuSel[c];
+                        bool selected = c == 0 ? audio[i].selected : c == 1 ? subs[i].selected : false;
+                        std::string label = c == 0 ? audio[i].label : c == 1 ? subs[i].label : optionLabel(i);
+                        if (focused) a.roundRect(colX[c] - 20, y - 6, 360, 40, 10, col::white.alpha(36));
+                        if (selected)
+                            a.poly({colX[c] - 4, y + 12, colX[c] + 2, y + 20, colX[c] + 14, y + 4, colX[c] + 14, y + 9,
+                                    colX[c] + 2, y + 25, colX[c] - 4, y + 17},
+                                   col::accentLight);
+                        if (label.size() > 30) label = label.substr(0, 28) + "...";
+                        a.text(colX[c] + 26, y, 22, focused ? col::white : selected ? col::text : col::dim, 7, label);
+                    }
+                    if (n == 0) a.text(colX[c], 210, 22, col::faint, 7, "None");
+                }
+                if (subsTask.active()) a.text(520, 600, 18, col::faint, 7, "Looking for more subtitles...");
+                char line[64];
+                a.pill(60, 660, "A");
+                a.text(100, 660, 18, col::dim, 4, menuCol == 2 ? "Change" : "Select");
+                a.pill(200, 660, "B");
+                a.text(240, 660, 18, col::dim, 4, "Close");
+                a.pill(540, 660, "L/R");
+                snprintf(line, sizeof(line), "Subtitle delay  %+.2f s", subDelay);
+                a.text(600, 660, 18, col::white, 4, line);
+                a.pill(880, 660, "ZL/ZR");
+                snprintf(line, sizeof(line), "Subtitle size  %d%%", (int)std::lround(subScale * 100));
+                a.text(958, 660, 18, col::white, 4, line);
+            } else {
+                if (controls) {
+                    a.gradientV(0, 170, col::black, 190, 0);
+                    a.gradientV(440, 280, col::black, 0, 215);
+                    a.poly({60, 50, 72, 40, 72, 60}, col::white);  // back arrow
+                    a.text(86, 50, 30, col::white, 4, ctx.name);
+                    if (!ctx.episodeLabel.empty()) a.text(86, 90, 21, col::dim, 4, ctx.episodeLabel);
+
+                    // Progress bar: played (accent), buffered (light), rest (dim)
+                    float bx = 60, bw = 1060, by = 616;
+                    float p = dur > 0 ? (float)std::min(1.0, pos / dur) : 0;
+                    float b = dur > 0 ? (float)std::min(1.0, (pos + std::max(0.0, cacheAhead)) / dur) : 0;
+                    a.roundRect(bx, by, bw, 6, 3, col::white.alpha(70));
+                    a.roundRect(bx, by, bw * b, 6, 3, col::white.alpha(120));
+                    a.roundRect(bx, by, std::max(6.0f, bw * p), 6, 3, col::accent);
+                    a.circle(bx + bw * p, by + 3, 9, col::white);
+                    a.text(1220, by + 3, 22, col::white, 6, dur > 0 ? "-" + clock(dur - pos) : clock(pos));
+                    a.text(bx, by - 30, 18, col::dim, 1, clock(pos) + (dur > 0 ? "  /  " + clock(dur) : ""));
+                    if (speedIdx != 2) a.text(bx + 1060, by - 30, 18, col::accentLight, 3, optionLabel(0));
+
+                    // Buttons row
+                    float ry = 668, x = 60;
+                    if (paused)
+                        a.playIcon(x, ry, 11, col::white);
+                    else
+                        a.pauseIcon(x, ry, 11, col::white);
+                    a.pill(x + 34, ry, "A");
+                    x += 110;
+                    a.poly({x + 14, ry - 10, x + 14, ry + 10, x, ry}, col::white);  // rewind
+                    a.text(x + 22, ry, 18, col::white, 4, "10");
+                    a.poly({x + 70, ry - 10, x + 70, ry + 10, x + 84, ry}, col::white);  // forward
+                    a.text(x + 48, ry, 18, col::white, 4, "10");
+                    a.text(x + 96, ry, 17, col::dim, 4, "Left / Right");
+                    a.pill(860, ry, "X");
+                    a.text(898, ry, 19, col::white, 4, "Audio, subtitles & more");
+                    a.pill(1150, ry, "B");
+                    a.text(1188, ry, 19, col::white, 4, "Back");
+                }
+                if (paused && !buffering) {
+                    a.circle(640, 360, 46, col::black.alpha(140));
+                    a.playIcon(626, 360, 20, col::white);
+                }
+                if (buffering) {
+                    a.spinner(640, 350, 28);
+                    a.text(640, 410, 22, col::white, 5,
+                           bufferPct > 0 && bufferPct < 100 ? "Buffering " + std::to_string(bufferPct) + "%" : "Buffering");
+                    if (isTorrent) a.text(640, 444, 18, col::dim, 5, torrentLine(*app.activeTorrent));
+                }
+                if (showFlash) {
+                    bool side = flash[0] == '+' || flash[0] == '-';
+                    float fx = !side ? 640.0f : flashRight ? 980.0f : 300.0f;
+                    uint32_t life = flash.compare(0, 6, "Paused") == 0 ? 3000 : 900;
+                    Uint8 fa = (Uint8)(255 * std::min(1.0f, (float)(life - (now - flashAt)) / 300.0f));
+                    float fw = side ? 120.0f : std::max(260.0f, flash.size() * 13.0f);
+                    a.roundRect(fx - fw / 2, 330, fw, 60, 30, col::black.alpha((Uint8)(fa * 0.6f)));
+                    a.text(fx, 360, 26, col::white.alpha(fa), 5, flash, false);
+                }
+                if (upShown) {  // Up next card
+                    float cx = 860, cy = 440, cw = 360, ch = 190;
+                    a.roundRect(cx, cy, cw, ch, 16, col::black.alpha(215));
+                    a.text(cx + 24, cy + 22, 18, col::accentLight, 7, "Up next");
+                    std::string lbl = nextLabel.size() > 34 ? nextLabel.substr(0, 32) + "..." : nextLabel;
+                    a.text(cx + 24, cy + 50, 24, col::white, 7, lbl);
+                    a.text(cx + 24, cy + 88, 18, col::dim, 7, "Playing in " + std::to_string(std::max(1, countdown)) + " s");
+                    a.roundRect(cx + 24, cy + 116, (cw - 48) * std::max(0, countdown) / 10.0f, 4, 2, col::accent);
+                    a.roundRect(cx + 20, cy + 130, 170, 44, 22, col::white);
+                    a.playIcon(cx + 40, cy + 152, 8, col::black);
+                    a.text(cx + 62, cy + 152, 19, col::black, 4, "Play now", false);
+                    a.roundRect(cx + 200, cy + 130, 140, 44, 22, col::white.alpha(50));
+                    a.text(cx + 270, cy + 152, 19, col::white, 5, "Cancel", false);
+                }
+            }
+            if (a.out != lastAss) {
+                lastAss = a.out;
+                if (a.out.empty()) {
+                    const char* args[] = {"osd-overlay", "1", "none", "", nullptr};
+                    mpv_command_async(mpv, 0, args);
+                } else {
+                    const char* args[] = {"osd-overlay", "1", "ass-events", a.out.c_str(), "1280", "720", nullptr};
+                    mpv_command_async(mpv, 0, args);
+                }
+            }
+        }
+
+        mpv_render_context_update(rctx);
+        int w = SCREEN_W, h = SCREEN_H;
+        SDL_GL_GetDrawableSize(win, &w, &h);
+        mpv_opengl_fbo fbo{0, w, h, 0};
+        int flipY = 1;
+        mpv_render_param rp[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
+            {MPV_RENDER_PARAM_FLIP_Y, &flipY},
+            {MPV_RENDER_PARAM_INVALID, nullptr},
+        };
+        mpv_render_context_render(rctx, rp);
+        SDL_GL_SwapWindow(win);
+        mpv_render_context_report_swap(rctx);
+    }
+
+    // A size picked in the player becomes the new default.
+    int newSize = (int)std::lround(subScale * 100);
+    if (newSize != app.cfg.subSize) {
+        app.cfg.subSize = newSize;
+        app.cfg.save();
+    }
+
+    res.position = propDouble(mpv, "time-pos", pos);
+    res.duration = propDouble(mpv, "duration", dur);
+    logMsg("player: stopped at %.0f / %.0f s%s", res.position, res.duration, res.ended ? " (ended)" : "");
+
+    appletSetMediaPlaybackState(false);
+    mpv_render_context_free(rctx);
+    mpv_terminate_destroy(mpv);
+    SDL_GL_DeleteContext(gl);
+    return res;
+}

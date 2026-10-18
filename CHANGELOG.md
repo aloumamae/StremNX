@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.3.0 (unreleased, untested on hardware)
+## 0.3.0 beta (2026-10-18)
+
+Tested on hardware; some bugs may remain.
 
 - Watch progress and **My List** synced with the Stremio account
 - **Continue Watching** reuses the stream picked last time; X picks another one; falls back to the list if it fails

@@ -283,6 +283,9 @@ void App::reloadAddons() {
             }
         }
         if (entries.empty()) entries.push_back(AddonEntry{CINEMETA_URL, Json()});
+        // Stremio ships OpenSubtitles by default; make sure it is there even if the account removed it
+        // or nobody is logged in (duplicates are skipped below).
+        entries.push_back(AddonEntry{OPENSUBTITLES_URL, Json()});
         for (auto& u : c.addons) entries.push_back(AddonEntry{u, Json()});
 
         std::set<std::string> seen;

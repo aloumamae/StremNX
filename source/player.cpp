@@ -132,6 +132,12 @@ void applyProperty(Observed& o, const mpv_event* ev) {
     }
 }
 
+// "sdmc:/x" is how libnx names SD card files, but mpv may not take that for a local path; a plain
+// "/x" reaches the same file through the default (SD card) device.
+std::string mpvPath(const std::string& p) {
+    return p.compare(0, 6, "sdmc:/") == 0 ? p.substr(5) : p;
+}
+
 std::string clock(double s) {
     if (s < 0 || std::isnan(s)) s = 0;
     int t = (int)s;
@@ -464,7 +470,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     }
 
     appletSetMediaPlaybackState(true);  // keep the console from sleeping during playback
-    command(mpv, "loadfile", url.c_str());
+    command(mpv, "loadfile", mpvPath(url).c_str());
 
     // Subtitles from addons (OpenSubtitles...): fetched and downloaded in the background, then added
     // to mpv once the file is loaded.
@@ -727,13 +733,17 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             std::string cur = obs.subLang;
             bool select = cur.empty() || !subLangMatches(subLang, cur);
             for (size_t i = 0; i < files.size(); i++) {
-                const char* args[] = {"sub-add", files[i].path.c_str(), i == 0 && select ? "select" : "auto",
+                std::string mp = mpvPath(files[i].path);
+                const char* args[] = {"sub-add", mp.c_str(), i == 0 && select ? "select" : "auto",
                                       files[i].title.c_str(), files[i].lang.c_str(), nullptr};
                 mpv_command_async(mpv, 0, args);
             }
             addedSubs = files;
             if (!files.empty() && select) {
                 flash = "Subtitles: " + files[0].title;
+                flashAt = now;
+            } else if (files.empty() && select) {
+                flash = std::string("No ") + subLang.label + " subtitles found for this video";
                 flashAt = now;
             }
         }
@@ -748,7 +758,8 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                 fileLoaded = true;
                 if (retries > 0)  // a reconnect reloaded the file: put the addon subtitles back
                     for (auto& f : addedSubs) {
-                        const char* args[] = {"sub-add", f.path.c_str(), "auto", f.title.c_str(), f.lang.c_str(), nullptr};
+                        std::string mp = mpvPath(f.path);
+                        const char* args[] = {"sub-add", mp.c_str(), "auto", f.title.c_str(), f.lang.c_str(), nullptr};
                         mpv_command_async(mpv, 0, args);
                     }
             }
@@ -780,7 +791,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             reconnecting = false;
             std::string at = std::to_string((int)pos);
             setAsync(mpv, "start", at.c_str());
-            command(mpv, "loadfile", url.c_str());
+            command(mpv, "loadfile", mpvPath(url).c_str());
         }
 
         watchBeat(WatchMain, "player: state");
@@ -808,7 +819,9 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             lastDraw = now;
             bool controls = now - lastInput < 4000 || paused;
             bool showFlash = !flash.empty() && now - flashAt < 900;
-            if (flash.size() > 12 && flash.compare(0, 12, "Paused while") == 0) showFlash = now - flashAt < 3000;
+            // Informational messages stay up longer than the quick seek / delay feedback.
+            uint32_t flashLife = (flash.rfind("Paused", 0) == 0 || flash.rfind("Subtitles:", 0) == 0 || flash.rfind("No ", 0) == 0) ? 3500 : 900;
+            showFlash = !flash.empty() && now - flashAt < flashLife;
             Ass a(font);
             if (!started) {
                 // Loading screen
@@ -904,7 +917,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                 if (showFlash) {
                     bool side = flash[0] == '+' || flash[0] == '-';
                     float fx = !side ? 640.0f : flashRight ? 980.0f : 300.0f;
-                    uint32_t life = flash.compare(0, 6, "Paused") == 0 ? 3000 : 900;
+                    uint32_t life = flashLife;
                     Uint8 fa = (Uint8)(255 * std::min(1.0f, (float)(life - (now - flashAt)) / 300.0f));
                     float fw = side ? 120.0f : std::max(260.0f, flash.size() * 13.0f);
                     a.roundRect(fx - fw / 2, 330, fw, 60, 30, col::black.alpha((Uint8)(fa * 0.6f)));

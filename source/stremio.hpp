@@ -10,6 +10,7 @@
 // https://github.com/Stremio/stremio-addon-sdk/blob/master/docs/protocol.md
 
 #define CINEMETA_URL "https://v3-cinemeta.strem.io/manifest.json"
+#define OPENSUBTITLES_URL "https://opensubtitles-v3.strem.io/manifest.json"  // official subtitles addon
 #define STREMIO_API "https://api.strem.io/api"
 
 struct Addon {

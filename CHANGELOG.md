@@ -2,6 +2,10 @@
 
 ## 0.3.1 (2026-10-19)
 
+- Fix: subtitles from addons often did not show up. OpenSubtitles v3 (the official Stremio subtitles addon) is now
+  always available, even when it is not on your account or you are not logged in
+- Fix: subtitle files and downloaded videos are passed to the player with a path it always understands
+- The player says so when there are no subtitles in your language for a video
 - Fix: the app could freeze while a stream was stalled (torrent without peers, slow link). The player no longer
   waits on mpv for its state.
 - Fix: the torrent engine could stall waiting for network packets, freezing the screen with it

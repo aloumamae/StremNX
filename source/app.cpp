@@ -70,6 +70,7 @@ bool App::init() {
     ensureDir("sdmc:/switch");
     ensureDir(APP_DIR);
     logOpen(APP_DIR "/log.txt");
+    watchdogStart();
     logMsg("StremNX starting");
 
     // The app used to be called "Stremio NX": bring over the login and watch history once.
@@ -186,7 +187,7 @@ void App::stopDownload(const std::string& infoHash, int fileIdx) {
     for (auto it = downloads.begin(); it != downloads.end(); ++it) {
         if ((*it)->infoHash() != infoHash || (*it)->fileIndex() != fileIdx) continue;
         (*it)->stop();
-        (*it)->waitStopped(3000);  // let it close the file before anyone deletes it
+
         downloads.erase(it);
         return;
     }
@@ -363,6 +364,7 @@ void App::run() {
         gfx.beginFrame();
         gfx.pumpImages();
 
+        watchBeat(WatchMain, "main: addons");
         if (addonsTask.ready()) {
             AddonsResult res = addonsTask.take();
             addons = std::move(res.addons);
@@ -381,6 +383,7 @@ void App::run() {
         }
 
         // Finished or failed background downloads release their peers and memory.
+        watchBeat(WatchMain, "main: downloads check");
         if (SDL_GetTicks() - lastDownloadCheck > 1000) {
             lastDownloadCheck = SDL_GetTicks();
             for (auto it = downloads.begin(); it != downloads.end();) {
@@ -396,6 +399,7 @@ void App::run() {
             }
         }
 
+        watchBeat(WatchMain, "main: screen update");
         if (!stack.empty()) stack.back()->update(*this);
         applyPending();
         if (stack.empty()) running = false;
@@ -410,8 +414,10 @@ void App::run() {
             if (playResume && h && h->position > 30 && !h->finished()) startAt = h->position;
             logMsg("playing: %s (start %.0fs)", url.c_str(), startAt);
 
+            watchBeat(WatchMain, "main: starting player");
             gfx.releaseRenderer();
             PlayResult res = runPlayer(*this, url, ctx, startAt);
+            watchBeat(WatchMain, "main: back from player");
             if (!gfx.restoreRenderer()) break;
 
             if (res.duration > 0) {
@@ -439,6 +445,7 @@ void App::run() {
             continue;
         }
 
+        watchBeat(WatchMain, "main: draw");
         hits.clear();  // rebuilt while drawing; taps next frame are matched against them
         gfx.clear(col::bg);
         stack.back()->draw(*this);
@@ -448,6 +455,7 @@ void App::run() {
             gfx.roundRect(x, SCREEN_H - 120, w, 50, 25, col::cardSel.alpha(245));
             gfx.text(toastMsg, SCREEN_W / 2, SCREEN_H - 107, 21, col::text, SCREEN_W - 160, AlignCenter);
         }
+        watchBeat(WatchMain, "main: present");
         gfx.present();
         if (gfx.frameCount() == 1) logMsg("run: first frame drawn");
     }

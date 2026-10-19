@@ -1162,6 +1162,11 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
         sendto(fd, data.data(), data.size(), 0, (sockaddr*)&a, sizeof(a));
     }
 
+    static bool readable(int fd) {
+        pollfd p{fd, POLLIN, 0};
+        return poll(&p, 1, 0) > 0 && (p.revents & POLLIN);
+    }
+
     static void put16(std::string& s, uint16_t v) {
         s += (char)(v >> 8);
         s += (char)v;
@@ -1252,10 +1257,12 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     }
 
     void utpReceive(std::vector<char>& buf, uint64_t now) {
-        for (;;) {
+        // Only read what poll says is there: a blocking read here would stall the whole engine
+        // (and the screen, which waits on its lock).
+        for (int k = 0; k < 256 && (k == 0 || readable(utpFd)); k++) {
             sockaddr_in from{};
             socklen_t flen = sizeof(from);
-            ssize_t n = recvfrom(utpFd, buf.data(), buf.size(), 0, (sockaddr*)&from, &flen);
+            ssize_t n = recvfrom(utpFd, buf.data(), buf.size(), MSG_DONTWAIT, (sockaddr*)&from, &flen);
             if (n < 20) {
                 if (n < 0) return;
                 continue;
@@ -1398,10 +1405,10 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     }
 
     void dhtReceive(std::vector<char>& buf) {
-        for (;;) {
+        for (int k = 0; k < 256 && (k == 0 || readable(dhtFd)); k++) {
             sockaddr_in from{};
             socklen_t flen = sizeof(from);
-            ssize_t n = recvfrom(dhtFd, buf.data(), buf.size(), 0, (sockaddr*)&from, &flen);
+            ssize_t n = recvfrom(dhtFd, buf.data(), buf.size(), MSG_DONTWAIT, (sockaddr*)&from, &flen);
             if (n <= 0) return;
             std::string data(buf.data(), (size_t)n);
             size_t pos = 0;
@@ -1460,6 +1467,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
         int utpIdx = -1, dhtIdx = -1;
 
         while (!stopping) {
+            watchBeat(WatchEngine, "engine: announce/connect");
             uint64_t now = nowMs();
             {
                 std::lock_guard<std::mutex> lock(m);
@@ -1494,6 +1502,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                 svcSleepThread(100000000ULL);
             else
                 poll(fds.data(), fds.size(), 100);
+            watchBeat(WatchEngine, "engine: peers");
 
             {
             std::lock_guard<std::mutex> lock(m);
@@ -1530,8 +1539,8 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                     continue;
                 }
                 if (re & POLLIN) {
-                    for (;;) {
-                        ssize_t n = recv(p.fd, buf.data(), buf.size(), 0);
+                    for (int k = 0; k < 16 && (k == 0 || readable(p.fd)); k++) {
+                        ssize_t n = recv(p.fd, buf.data(), buf.size(), MSG_DONTWAIT);
                         if (n > 0) {
                             p.in.append(buf.data(), (size_t)n);
                             p.lastRecv = now;
@@ -1617,7 +1626,9 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
                 speedAt = now;
             }
             }
+            watchBeat(WatchEngine, "engine: SD card allocate");
             allocateFile();
+            watchBeat(WatchEngine, "engine: SD card write");
             flushWrites(false);
         }
 
@@ -1640,6 +1651,7 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
         engineDone = true;
         cv.notify_all();
         logMsg("torrent: engine stopped");
+        watchIdle(WatchEngine);
     }
 };
 

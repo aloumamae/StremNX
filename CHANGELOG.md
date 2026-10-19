@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 (2026-10-19)
+
+- Fix: the app could freeze while a stream was stalled (torrent without peers, slow link). The player no longer
+  waits on mpv for its state.
+- Fix: the torrent engine could stall waiting for network packets, freezing the screen with it
+- Fix: pausing or deleting a download no longer holds the screen
+- A watchdog writes to `log.txt` where the app got stuck if it ever freezes for more than 4 seconds
+
 ## 0.3.0 beta (2026-10-18)
 
 Tested on hardware; some bugs may remain.

@@ -10,6 +10,7 @@
 #include "keyboard.hpp"
 #include "log.hpp"
 #include "screens.hpp"
+#include "thread.hpp"
 
 namespace {
 
@@ -1244,9 +1245,21 @@ public:
             if (in.pressed(K_A) || (tap && tid == 41)) {
                 confirmDelete = false;
                 if (confirmBtn == 0) {
+                    std::shared_ptr<Torrent> t = app.findDownload(d.infoHash, d.fileIdx);
                     app.stopDownload(d.infoHash, d.fileIdx);
-                    app.toast(deleteDownload(d) ? "Deleted from the SD card" : "Could not delete the file");
-                    refreshDownloads(true);
+                    if (t) {  // the engine closes the file in its own time: delete after that, off the UI thread
+                        DownloadInfo dd = d;
+                        startThread([t, dd]() {
+                            t->waitStopped(20000);
+                            deleteDownload(dd);
+                        });
+                        dls.erase(dls.begin() + dlSel);
+                        dlSel = std::max(0, std::min(dlSel, (int)dls.size() - 1));
+                        app.toast("Deleted from the SD card");
+                    } else {
+                        app.toast(deleteDownload(d) ? "Deleted from the SD card" : "Could not delete the file");
+                        refreshDownloads(true);
+                    }
                 }
             }
             return;

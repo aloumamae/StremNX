@@ -60,3 +60,57 @@ bool fileExists(const std::string& path) {
 void ensureDir(const std::string& path) {
     mkdir(path.c_str(), 0777);
 }
+
+// ---------------------------------------------------------------- watchdog
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+#include <SDL2/SDL.h>
+
+#include "thread.hpp"
+
+namespace {
+struct WatchState {
+    std::atomic<uint32_t> beat{0};
+    std::atomic<const char*> stage{"start"};
+    std::atomic<bool> idle{true};
+};
+WatchState g_watch[WatchSlots];
+const char* const kSlotNames[WatchSlots] = {"main thread", "torrent engine"};
+}  // namespace
+
+void watchBeat(int slot, const char* stage) {
+    g_watch[slot].stage = stage;
+    g_watch[slot].beat = SDL_GetTicks();
+    g_watch[slot].idle = false;
+}
+
+void watchIdle(int slot) {
+    g_watch[slot].idle = true;
+}
+
+void watchdogStart() {
+    startThread(
+        []() {
+            bool reported[WatchSlots] = {};
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                uint32_t now = SDL_GetTicks();
+                for (int s = 0; s < WatchSlots; s++) {
+                    WatchState& w = g_watch[s];
+                    uint32_t last = w.beat;
+                    bool stuck = !w.idle && last != 0 && now - last > 4000;
+                    if (stuck && !reported[s]) {
+                        logMsg("WATCHDOG: %s stuck for %u ms at stage '%s'", kSlotNames[s], now - last, (const char*)w.stage);
+                        reported[s] = true;
+                    } else if (!stuck && reported[s]) {
+                        logMsg("WATCHDOG: %s recovered (stage '%s')", kSlotNames[s], (const char*)w.stage);
+                        reported[s] = false;
+                    }
+                }
+            }
+        },
+        64 * 1024);
+}

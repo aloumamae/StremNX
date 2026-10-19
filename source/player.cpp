@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <vector>
 
@@ -48,29 +49,87 @@ void command(mpv_handle* mpv, const char* a, const char* b = nullptr, const char
     mpv_command_async(mpv, 0, args);
 }
 
-double propDouble(mpv_handle* mpv, const char* name, double def = 0) {
-    double v = def;
-    if (mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &v) < 0) return def;
-    return v;
+// Property changes are never read synchronously: mpv_get_property waits for the player core, which
+// can be busy for a long time when a stream stalls (a torrent without peers, a slow link), and the
+// whole app would freeze with it. Values arrive through MPV_EVENT_PROPERTY_CHANGE instead, and
+// writes use the async API.
+
+void setAsync(mpv_handle* mpv, const char* name, double v) {
+    mpv_set_property_async(mpv, 0, name, MPV_FORMAT_DOUBLE, &v);
 }
 
-int64_t propInt(mpv_handle* mpv, const char* name, int64_t def = 0) {
-    int64_t v = def;
-    if (mpv_get_property(mpv, name, MPV_FORMAT_INT64, &v) < 0) return def;
-    return v;
+void setAsync(mpv_handle* mpv, const char* name, const char* v) {
+    mpv_set_property_async(mpv, 0, name, MPV_FORMAT_STRING, &v);
 }
 
-bool propFlag(mpv_handle* mpv, const char* name) {
-    int v = 0;
-    mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &v);
-    return v != 0;
+struct TrackInfo {
+    int64_t id = 0;
+    std::string type, lang, title, codec;
+    bool selected = false;
+};
+
+struct Observed {
+    double pos = 0, dur = 0, cacheTime = 0;
+    bool paused = false, pausedForCache = false, seeking = false;
+    int64_t bufferPct = 0;
+    std::string sid, subLang;
+    std::vector<TrackInfo> tracks;
+};
+
+enum ObsId { ObsPos = 1, ObsDur, ObsPause, ObsPausedForCache, ObsSeeking, ObsBuffer, ObsCacheTime, ObsTracks, ObsSid, ObsSubLang };
+
+void observeAll(mpv_handle* mpv) {
+    mpv_observe_property(mpv, ObsPos, "time-pos", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(mpv, ObsDur, "duration", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(mpv, ObsPause, "pause", MPV_FORMAT_FLAG);
+    mpv_observe_property(mpv, ObsPausedForCache, "paused-for-cache", MPV_FORMAT_FLAG);
+    mpv_observe_property(mpv, ObsSeeking, "seeking", MPV_FORMAT_FLAG);
+    mpv_observe_property(mpv, ObsBuffer, "cache-buffering-state", MPV_FORMAT_INT64);
+    mpv_observe_property(mpv, ObsCacheTime, "demuxer-cache-time", MPV_FORMAT_DOUBLE);
+    mpv_observe_property(mpv, ObsTracks, "track-list", MPV_FORMAT_NODE);
+    mpv_observe_property(mpv, ObsSid, "sid", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, ObsSubLang, "current-tracks/sub/lang", MPV_FORMAT_STRING);
 }
 
-std::string propString(mpv_handle* mpv, const std::string& name) {
-    char* s = mpv_get_property_string(mpv, name.c_str());
-    std::string out = s ? s : "";
-    if (s) mpv_free(s);
+std::vector<TrackInfo> parseTracks(const mpv_node& list) {
+    std::vector<TrackInfo> out;
+    if (list.format != MPV_FORMAT_NODE_ARRAY) return out;
+    for (int i = 0; i < list.u.list->num; i++) {
+        const mpv_node& m = list.u.list->values[i];
+        if (m.format != MPV_FORMAT_NODE_MAP) continue;
+        TrackInfo t;
+        for (int k = 0; k < m.u.list->num; k++) {
+            const char* key = m.u.list->keys[k];
+            const mpv_node& v = m.u.list->values[k];
+            std::string s = v.format == MPV_FORMAT_STRING ? v.u.string : "";
+            if (!strcmp(key, "id") && v.format == MPV_FORMAT_INT64) t.id = v.u.int64;
+            else if (!strcmp(key, "type")) t.type = s;
+            else if (!strcmp(key, "lang")) t.lang = s;
+            else if (!strcmp(key, "title")) t.title = s;
+            else if (!strcmp(key, "codec")) t.codec = s;
+            else if (!strcmp(key, "selected") && v.format == MPV_FORMAT_FLAG) t.selected = v.u.flag != 0;
+        }
+        out.push_back(t);
+    }
     return out;
+}
+
+// Applies one MPV_EVENT_PROPERTY_CHANGE to the observed state.
+void applyProperty(Observed& o, const mpv_event* ev) {
+    auto* p = static_cast<mpv_event_property*>(ev->data);
+    bool has = p->format != MPV_FORMAT_NONE && p->data;
+    switch (ev->reply_userdata) {
+        case ObsPos: if (has) o.pos = *(double*)p->data; break;
+        case ObsDur: o.dur = has ? *(double*)p->data : 0; break;
+        case ObsPause: o.paused = has && *(int*)p->data; break;
+        case ObsPausedForCache: o.pausedForCache = has && *(int*)p->data; break;
+        case ObsSeeking: o.seeking = has && *(int*)p->data; break;
+        case ObsBuffer: o.bufferPct = has ? *(int64_t*)p->data : 0; break;
+        case ObsCacheTime: o.cacheTime = has ? *(double*)p->data : 0; break;
+        case ObsTracks: o.tracks = has ? parseTracks(*(mpv_node*)p->data) : std::vector<TrackInfo>(); break;
+        case ObsSid: o.sid = has ? *(char**)p->data : ""; break;
+        case ObsSubLang: o.subLang = has ? *(char**)p->data : ""; break;
+    }
 }
 
 std::string clock(double s) {
@@ -257,20 +316,16 @@ struct Track {
     bool selected = false;
 };
 
-std::vector<Track> loadTracks(mpv_handle* mpv, const std::string& type) {
+std::vector<Track> loadTracks(const Observed& obs, const std::string& type) {
     std::vector<Track> out;
-    int64_t n = propInt(mpv, "track-list/count");
-    for (int64_t i = 0; i < n; i++) {
-        std::string p = "track-list/" + std::to_string(i) + "/";
-        if (propString(mpv, p + "type") != type) continue;
+    for (auto& i : obs.tracks) {
+        if (i.type != type) continue;
         Track t;
-        t.id = propInt(mpv, (p + "id").c_str());
-        std::string lang = propString(mpv, p + "lang"), title = propString(mpv, p + "title");
-        std::string codec = propString(mpv, p + "codec");
-        t.label = !title.empty() ? title : !lang.empty() ? lang : "Track " + std::to_string(t.id);
-        if (!lang.empty() && !title.empty() && title.find(lang) == std::string::npos) t.label += "  (" + lang + ")";
-        if (type == "audio" && !codec.empty()) t.label += "  ·  " + codec;
-        t.selected = propString(mpv, p + "selected") == "yes";
+        t.id = i.id;
+        t.label = !i.title.empty() ? i.title : !i.lang.empty() ? i.lang : "Track " + std::to_string(t.id);
+        if (!i.lang.empty() && !i.title.empty() && i.title.find(i.lang) == std::string::npos) t.label += "  (" + i.lang + ")";
+        if (type == "audio" && !i.codec.empty()) t.label += "  ·  " + i.codec;
+        t.selected = i.selected;
         out.push_back(t);
     }
     return out;
@@ -345,7 +400,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     setOpt(mpv, "demuxer-max-bytes", "48MiB");
     setOpt(mpv, "demuxer-max-back-bytes", "8MiB");
     setOpt(mpv, "network-timeout", "30");
-    setOpt(mpv, "user-agent", "StremNX/0.3");
+    setOpt(mpv, "user-agent", "StremNX/0.3.1");
     setOpt(mpv, "keep-open", "no");
     setOpt(mpv, "volume-max", "200");
     setOpt(mpv, "osd-level", "1");
@@ -422,12 +477,14 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         if (!cands.empty()) subsTask.start([cands, type, vid, code]() { return fetchAddonSubs(cands, type, vid, code); });
     }
     bool fileLoaded = false;
+    Observed obs;
+    observeAll(mpv);
     double subDelay = cfg.subDelayMs / 1000.0, subScale = cfg.subSize / 100.0;
     std::vector<SubFile> addedSubs;  // re-added after a reconnect
 
     // UI state
     bool quit = false, started = false;
-    uint32_t lastInput = SDL_GetTicks(), lastProps = 0, lastDraw = 0;
+    uint32_t lastInput = SDL_GetTicks(), lastDraw = 0;
     double pos = startAt, dur = 0, cacheAhead = 0;
     bool paused = false, buffering = false;
     int64_t bufferPct = 0;
@@ -463,8 +520,8 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     int64_t lastWall = (int64_t)time(nullptr);
 
     auto openMenu = [&]() {
-        audio = loadTracks(mpv, "audio");
-        subs = loadTracks(mpv, "sub");
+        audio = loadTracks(obs, "audio");
+        subs = loadTracks(obs, "sub");
         Track off;
         off.id = -1;
         off.label = "Off";
@@ -494,26 +551,26 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             case 0: {
                 speedIdx = (speedIdx + dir + 6) % 6;
                 double v = speeds[speedIdx];
-                mpv_set_property(mpv, "speed", MPV_FORMAT_DOUBLE, &v);
+                setAsync(mpv, "speed", v);
                 break;
             }
             case 1: {
                 aspectIdx = (aspectIdx + dir + 5) % 5;
                 double pan = aspectIdx == 4 ? 1.0 : 0.0;  // "fill" crops the sides instead of letterboxing
-                mpv_set_property(mpv, "panscan", MPV_FORMAT_DOUBLE, &pan);
-                mpv_set_property_string(mpv, "video-aspect-override", aspectIdx == 0 || aspectIdx == 4 ? "no" : aspects[aspectIdx]);
+                setAsync(mpv, "panscan", pan);
+                setAsync(mpv, "video-aspect-override", aspectIdx == 0 || aspectIdx == 4 ? "no" : aspects[aspectIdx]);
                 break;
             }
             case 2: {
                 zoomIdx = (zoomIdx + dir + 4) % 4;
                 double z = zooms[zoomIdx];
-                mpv_set_property(mpv, "video-zoom", MPV_FORMAT_DOUBLE, &z);
+                setAsync(mpv, "video-zoom", z);
                 break;
             }
             case 3: {
                 volumeIdx = (volumeIdx + dir + 4) % 4;
                 double v = volumes[volumeIdx];
-                mpv_set_property(mpv, "volume", MPV_FORMAT_DOUBLE, &v);
+                setAsync(mpv, "volume", v);
                 break;
             }
         }
@@ -524,7 +581,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         if (idx < 0 || idx >= (int)list.size()) return;
         Track& t = list[idx];
         std::string id = t.id < 0 ? "no" : std::to_string(t.id);
-        mpv_set_property_string(mpv, col == 0 ? "aid" : "sid", id.c_str());
+        setAsync(mpv, col == 0 ? "aid" : "sid", id.c_str());
         for (auto& x : list) x.selected = &x == &t;
         if (col == 1 && t.id >= 0) lastSubId = id;
     };
@@ -551,6 +608,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         while (SDL_PollEvent(&e))
             if (e.type == SDL_QUIT) quit = true;
 
+        watchBeat(WatchMain, "player: input");
         Input& in = app.in;
         in.update();
         uint32_t now = SDL_GetTicks();
@@ -621,9 +679,9 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             if (in.pressed(K_ZR)) seekBy(60);
             if (in.pressed(K_X)) openMenu();
             if (in.pressed(K_Y)) {
-                std::string sid = propString(mpv, "sid");
+                std::string sid = obs.sid;
                 bool off = sid == "no" || sid.empty();
-                mpv_set_property_string(mpv, "sid", off ? lastSubId.c_str() : "no");
+                setAsync(mpv, "sid", off ? lastSubId.c_str() : "no");
                 if (!off) lastSubId = sid;
                 flash = off ? "Subtitles on" : "Subtitles off";
                 flashAt = now;
@@ -652,7 +710,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         if (in.pressed(K_L) || in.pressed(K_R)) {
             subDelay += (in.pressed(K_R) ? 1 : -1) * cfg.subStepMs / 1000.0;
             if (std::fabs(subDelay) < 0.001) subDelay = 0;
-            mpv_set_property(mpv, "sub-delay", MPV_FORMAT_DOUBLE, &subDelay);
+            setAsync(mpv, "sub-delay", subDelay);
             char b[48];
             snprintf(b, sizeof(b), "Subtitle delay %+.2f s", subDelay);
             flash = b;
@@ -660,13 +718,13 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         }
         if (menuOpen && (in.pressed(K_ZL) || in.pressed(K_ZR))) {
             subScale = std::max(0.5, std::min(2.5, subScale + (in.pressed(K_ZR) ? 0.1 : -0.1)));
-            mpv_set_property(mpv, "sub-scale", MPV_FORMAT_DOUBLE, &subScale);
+            setAsync(mpv, "sub-scale", subScale);
         }
 
         // Addon subtitles arrived: add them, and pick one if nothing in the preferred language is on.
         if (fileLoaded && subsTask.ready()) {
             std::vector<SubFile> files = subsTask.take();
-            std::string cur = propString(mpv, "current-tracks/sub/lang");
+            std::string cur = obs.subLang;
             bool select = cur.empty() || !subLangMatches(subLang, cur);
             for (size_t i = 0; i < files.size(); i++) {
                 const char* args[] = {"sub-add", files[i].path.c_str(), i == 0 && select ? "select" : "auto",
@@ -685,6 +743,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             if (ev->event_id == MPV_EVENT_NONE) break;
             if (ev->event_id == MPV_EVENT_SHUTDOWN) quit = true;
             if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) started = true;
+            if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) applyProperty(obs, ev);
             if (ev->event_id == MPV_EVENT_FILE_LOADED) {
                 fileLoaded = true;
                 if (retries > 0)  // a reconnect reloaded the file: put the addon subtitles back
@@ -720,19 +779,17 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         if (reconnecting && now >= reconnectAt) {
             reconnecting = false;
             std::string at = std::to_string((int)pos);
-            mpv_set_property_string(mpv, "start", at.c_str());
+            setAsync(mpv, "start", at.c_str());
             command(mpv, "loadfile", url.c_str());
         }
 
-        if (now - lastProps > 100) {
-            lastProps = now;
-            pos = propDouble(mpv, "time-pos", pos);
-            dur = propDouble(mpv, "duration", dur);
-            paused = propFlag(mpv, "pause");
-            buffering = propFlag(mpv, "paused-for-cache") || propFlag(mpv, "seeking");
-            bufferPct = propInt(mpv, "cache-buffering-state", 0);
-            cacheAhead = propDouble(mpv, "demuxer-cache-time", pos) - pos;
-        }
+        watchBeat(WatchMain, "player: state");
+        pos = obs.pos > 0 || started ? obs.pos : pos;
+        dur = obs.dur;
+        paused = obs.paused;
+        buffering = obs.pausedForCache || obs.seeking;
+        bufferPct = obs.bufferPct;
+        cacheAhead = obs.cacheTime - pos;
 
         // Up next: the card appears in the last 20 s and counts down from 10.
         if (upNextOn && !upCancelled && !upShown && started && dur > 60 && dur - pos <= 20 && !menuOpen) {
@@ -746,6 +803,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         }
 
         // ------------------------------------------------ overlay
+        watchBeat(WatchMain, "player: overlay");
         if (now - lastDraw > 66) {
             lastDraw = now;
             bool controls = now - lastInput < 4000 || paused;
@@ -879,6 +937,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             }
         }
 
+        watchBeat(WatchMain, "player: render");
         mpv_render_context_update(rctx);
         int w = SCREEN_W, h = SCREEN_H;
         SDL_GL_GetDrawableSize(win, &w, &h);
@@ -890,6 +949,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
         mpv_render_context_render(rctx, rp);
+        watchBeat(WatchMain, "player: swap");
         SDL_GL_SwapWindow(win);
         mpv_render_context_report_swap(rctx);
     }
@@ -901,12 +961,13 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         app.cfg.save();
     }
 
-    res.position = propDouble(mpv, "time-pos", pos);
-    res.duration = propDouble(mpv, "duration", dur);
+    res.position = pos;  // last values mpv reported (asking now could block on a stalled stream)
+    res.duration = dur;
     logMsg("player: stopped at %.0f / %.0f s%s", res.position, res.duration, res.ended ? " (ended)" : "");
 
     appletSetMediaPlaybackState(false);
     mpv_render_context_free(rctx);
+    watchBeat(WatchMain, "player: shutting down mpv");
     mpv_terminate_destroy(mpv);
     SDL_GL_DeleteContext(gl);
     return res;

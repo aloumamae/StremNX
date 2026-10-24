@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,9 @@ public:
     void save() const;
 
     void record(const PlayContext& ctx, double position, double duration);
+    // Takes a title out of Continue Watching and Recently Watched for good, on this Switch: the account
+    // sync doesn't bring it back unless it is watched again (here or on another device).
+    void removeTitle(const std::string& metaId);
     void mergeAccount(const std::vector<HistoryEntry>& items);
 
     const HistoryEntry* findVideo(const std::string& videoId) const;
@@ -56,6 +60,7 @@ public:
 
 private:
     std::vector<HistoryEntry> entries;
+    std::map<std::string, int64_t> removed;  // metaId -> when it was removed
 };
 
 int64_t parseIsoTime(const std::string& iso);

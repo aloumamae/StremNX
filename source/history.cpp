@@ -22,6 +22,8 @@ void History::load() {
         return;
     }
     entries.clear();
+    removed.clear();
+    for (auto& r : j["removed"].items()) removed[r["metaId"].str()] = (int64_t)r["at"].num();
     for (auto& e : j["entries"].items()) {
         HistoryEntry h;
         h.metaId = e["metaId"].str();
@@ -72,14 +74,21 @@ void History::save() const {
         e.set("position", h.position).set("duration", h.duration).set("updated", (double)h.updated);
         arr.push(e);
     }
+    Json gone = Json::array();
+    for (auto& kv : removed) {
+        Json r = Json::object();
+        r.set("metaId", kv.first).set("at", (double)kv.second);
+        gone.push(r);
+    }
     Json j = Json::object();
-    j.set("entries", arr);
+    j.set("entries", arr).set("removed", gone);
     std::string text = j.dump();
     if (!writeFile(kHistoryPath, text.data(), text.size())) logMsg("failed to save history");
 }
 
 void History::record(const PlayContext& ctx, double position, double duration) {
     if (ctx.metaId.empty() || ctx.videoId.empty() || duration <= 0) return;
+    removed.erase(ctx.metaId);  // watched again: it belongs in the lists again
     HistoryEntry h;
     static_cast<PlayContext&>(h) = ctx;
     h.position = position;
@@ -95,6 +104,8 @@ void History::record(const PlayContext& ctx, double position, double duration) {
 
 void History::mergeAccount(const std::vector<HistoryEntry>& items) {
     for (auto& a : items) {
+        auto gone = removed.find(a.metaId);
+        if (gone != removed.end() && a.updated <= gone->second) continue;  // removed by hand, not watched since
         auto it = std::find_if(entries.begin(), entries.end(),
                                [&](const HistoryEntry& e) { return e.videoId == a.videoId; });
         if (it == entries.end()) {
@@ -108,6 +119,13 @@ void History::mergeAccount(const std::vector<HistoryEntry>& items) {
     std::stable_sort(entries.begin(), entries.end(),
                      [](const HistoryEntry& x, const HistoryEntry& y) { return x.updated > y.updated; });
     if (entries.size() > kMaxEntries) entries.resize(kMaxEntries);
+}
+
+void History::removeTitle(const std::string& metaId) {
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const HistoryEntry& e) { return e.metaId == metaId; }),
+                  entries.end());
+    removed[metaId] = (int64_t)time(nullptr);
+    save();
 }
 
 const HistoryEntry* History::findVideo(const std::string& videoId) const {

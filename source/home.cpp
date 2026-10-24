@@ -24,12 +24,17 @@ constexpr size_t kRowLimit = 40;
 struct Card {
     MetaItem item;
     bool isContinue = false;
+    bool fromHistory = false;  // Continue Watching / Recently Watched: can be removed
     HistoryEntry entry;
 };
 
 struct Row {
+    std::string key;  // its Settings > Home sections key (home screen rows)
     std::string title;
-    bool landscape = false;
+    bool landscape = false;  // Continue Watching: backdrop cards with the title on them
+    // The catalog's own artwork shape: the addon's posterShape or, when it doesn't say, the first image.
+    enum Shape { Tall, Wide, Square } shape = Tall;
+    bool shapeKnown = false;
     bool feedsHero = false;
     std::vector<Card> cards;
     std::function<CatalogResult()> loader;
@@ -40,14 +45,14 @@ struct Row {
     int sel = 0;
     float scrollX = 0;
 
-    int cardW() const { return landscape ? 300 : 158; }
-    int cardH() const { return landscape ? 169 : 237; }
+    int cardW() const { return landscape || shape == Wide ? 300 : shape == Square ? 210 : 158; }
+    int cardH() const { return landscape || shape == Wide ? 169 : shape == Square ? 210 : 237; }
     bool hidden() const { return loaded && cards.empty(); }
     int height() const { return hidden() ? 0 : 44 + cardH() + (landscape ? 66 : 60); }
 };
 
 struct PageAction {
-    enum Kind { None, Details, Play, Resume, OtherStreams } kind = None;
+    enum Kind { None, Details, Play, Resume, OtherStreams, Remove } kind = None;
     MetaItem item;
     HistoryEntry entry;
 };
@@ -145,6 +150,12 @@ public:
                     continue;
                 }
                 for (auto& it : res.items) r.cards.push_back(Card{it});
+                for (auto& it : res.items) {
+                    if (it.posterShape.empty()) continue;
+                    r.shape = it.posterShape == "landscape" ? Row::Wide : it.posterShape == "square" ? Row::Square : Row::Tall;
+                    r.shapeKnown = true;
+                    break;
+                }
                 r.loaded = true;
             }
         }
@@ -162,7 +173,7 @@ public:
 
         // Touch: tapping a card selects it; tapping the selected card (or a hero button) opens it.
         int tid = 0, ta = 0, tb = 0;
-        bool tapOpen = false;
+        bool tapOpen = false, tapRemove = false;
         if (app.tapped(tid, ta, tb)) {
             if (tid == 10 && hasHero) {
                 focus = 0;
@@ -170,6 +181,10 @@ public:
                 tapOpen = true;
             } else if (tid == 11 && ta < (int)rows.size() && tb < (int)rows[ta].cards.size()) {
                 tapOpen = focus == ta + 1 && rows[ta].sel == tb;
+                focus = ta + 1;
+                rows[ta].sel = tb;
+            } else if (tid == 12 && ta < (int)rows.size() && tb < (int)rows[ta].cards.size()) {
+                tapRemove = true;  // the X on a history card
                 focus = ta + 1;
                 rows[ta].sel = tb;
             }
@@ -200,7 +215,16 @@ public:
             act.kind = PageAction::Details;
         else if (in.pressed(K_X) && c.isContinue)
             act.kind = PageAction::OtherStreams;
+        else if ((in.pressed(K_MINUS) || tapRemove) && c.fromHistory)
+            act.kind = PageAction::Remove;
         return act;
+    }
+
+    // The focused card is in Continue Watching / Recently Watched (for the footer hint).
+    bool historyFocused() const {
+        if (focus < 1 || focus > (int)rows.size()) return false;
+        const Row& r = rows[focus - 1];
+        return !r.cards.empty() && r.cards[std::min(r.sel, (int)r.cards.size() - 1)].fromHistory;
     }
 
     void draw(App& app) {
@@ -329,6 +353,15 @@ private:
         float maxX = (float)std::max(0, n * step - kGap - (W - 2 * kMarginX));
         r.scrollX = approach(r.scrollX, std::min(target, maxX), 0.25f);
 
+        if (!r.shapeKnown && !r.landscape && n > 0) {  // the addon didn't say: go by the first image
+            if (SDL_Texture* t = g.image(r.cards[0].item.poster)) {
+                int tw = 0, th = 0;
+                SDL_QueryTexture(t, nullptr, nullptr, &tw, &th);
+                if (tw > th * 1.2f) r.shape = Row::Wide;
+                else if (std::abs(tw - th) < tw / 10) r.shape = Row::Square;
+                r.shapeKnown = true;
+            }
+        }
         if (n == 0 && !r.loaded) {  // skeleton cards while loading
             Uint8 pulse = (Uint8)(40 + 25 * std::sin(SDL_GetTicks() / 250.0));
             for (int i = 0; i * step < W; i++) g.roundRect(kMarginX + i * step, cy, cw, ch, 6, col::card.alpha(pulse + 120));
@@ -343,6 +376,12 @@ private:
             else
                 drawPoster(g, r.cards[i], x, cy, cw, ch, sel);
             app.hit(x, cy, cw, ch, 11, rowIdx, i);
+            if (sel && r.cards[i].fromHistory) {  // × to remove it (touch / pointer; - on the controller)
+                int bx = x + cw - 22, by = cy + 4;
+                g.text("\xC3\x97", bx + 1, by + 1, 30, col::black.alpha(150), 0, AlignCenter);  // soft shadow
+                g.text("\xC3\x97", bx, by, 30, col::white, 0, AlignCenter);
+                app.hit(bx - 22, by - 6, 44, 44, 12, rowIdx, i);
+            }
         }
     }
 
@@ -359,9 +398,16 @@ public:
         Uint8 fade = 0;
         SDL_Texture* t = g.image(c.item.poster, &fade);
         g.rect(x, y, w, h, col::card);
-        if (t)
-            g.drawTex(t, x, y, w, h, fade);
-        else
+        int tw = 0, th = 0;
+        if (t) SDL_QueryTexture(t, nullptr, nullptr, &tw, &th);
+        if (t && tw > 0 && th > 0) {
+            float s = std::min((float)w / tw, (float)h / th);
+            int dw = (int)(tw * s), dh = (int)(th * s);
+            if (std::abs(dw - w) < w / 8 && std::abs(dh - h) < h / 8)
+                g.drawTex(t, x, y, w, h, fade);  // the card's shape: fill it
+            else
+                g.drawTex(t, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh, fade);  // another shape: whole, never squashed
+        } else
             g.textWrapped(c.item.name, x + 12, y + 14, 19, col::dim, w - 24, h - 28);
         if (c.entry.duration > 0) {  // from the watch history
             if (c.entry.finished()) {
@@ -457,13 +503,26 @@ struct HomeSection {
     std::string key, title, type, addonName;
     CatalogPick pick;  // points into App::addons: use it right away, not after a reload
     bool on = true;
+    bool fixed = false;  // Continue Watching, My List, Recently Watched: built from local data
 };
 
-// The home screen's catalog rows: every catalog the addons offer, in the order picked in Settings >
-// Home sections. Ones not placed yet keep the default order (the first movie and series catalogs,
-// usually "Popular", then the rest by type). Switched-off ones come back with on = false.
+// The home screen's rows: Continue Watching, My List and Recently Watched, then every catalog the
+// addons offer, in the order picked in Settings > Home sections. Ones not placed yet keep the default
+// order (those three, the first movie and series catalogs, usually "Popular", then the rest by type).
+// Switched-off ones come back with on = false.
 std::vector<HomeSection> homeSections(App& app) {
     std::vector<HomeSection> out, rest;
+    const auto& hidden = app.cfg.homeHidden;
+    for (auto& f : {std::pair<const char*, const char*>{"#continue", "Continue Watching"},
+                    {"#mylist", "My List"}, {"#recent", "Recently Watched"}}) {
+        HomeSection s;
+        s.key = f.first;
+        s.title = f.second;
+        s.addonName = s.key == "#mylist" ? "Your Stremio library" : "Your watch history";
+        s.fixed = true;
+        s.on = std::find(hidden.begin(), hidden.end(), s.key) == hidden.end();
+        out.push_back(s);
+    }
     std::set<std::string> used;
     for (auto& type : catalogTypes(app.addons)) {
         bool first = true;
@@ -477,7 +536,6 @@ std::vector<HomeSection> homeSections(App& app) {
             s.type = type;
             s.addonName = c.addon->name;
             s.pick = c;
-            const auto& hidden = app.cfg.homeHidden;
             s.on = std::find(hidden.begin(), hidden.end(), key) == hidden.end();
             bool lead = first && (type == "movie" || type == "series");
             (lead ? out : rest).push_back(s);
@@ -486,9 +544,9 @@ std::vector<HomeSection> homeSections(App& app) {
     }
     out.insert(out.end(), rest.begin(), rest.end());
     const auto& order = app.cfg.homeOrder;
-    auto rank = [&](const HomeSection& s) {
+    auto rank = [&](const HomeSection& s) {  // not placed yet: history rows on top, new catalogs at the end
         auto it = std::find(order.begin(), order.end(), s.key);
-        return it == order.end() ? order.size() : (size_t)(it - order.begin());
+        return it != order.end() ? (size_t)(it - order.begin()) + 1 : s.fixed ? 0 : order.size() + 1;
     };
     std::stable_sort(out.begin(), out.end(), [&](const HomeSection& a, const HomeSection& b) { return rank(a) < rank(b); });
     return out;
@@ -714,6 +772,8 @@ class HomeScreen : public Screen {
     std::string query;
     int tab = TAB_HOME;
     int seenAddons = -1, seenHistory = -1, seenLibrary = -1, seenHome = 0;
+    std::string removeId, removeName;  // title waiting for "Remove from your history?"
+    int removeBtn = 1;                 // 0 remove, 1 cancel
     float tabX = 0, tabW = 0;  // animated underline
 
     int accSel = 0;
@@ -727,39 +787,64 @@ public:
         search.emptyText = "Press Y to search movies and series";
     }
 
-    // Continue Watching, My List and Recently Watched: built from local data, nothing to fetch.
-    std::vector<Row> fixedRows(App& app) {
+    // Continue Watching, My List or Recently Watched: built from local data, nothing to fetch.
+    Row fixedRow(App& app, const std::string& key) {
+        Row r;
+        r.key = key;
+        r.loaded = true;
+        if (key == "#continue") {
+            r.title = "Continue Watching";
+            r.landscape = true;
+            for (auto& e : app.history.continueWatching(15)) {
+                Card c;
+                c.item = itemFromEntry(e);
+                c.isContinue = true;
+                c.fromHistory = true;
+                c.entry = e;
+                r.cards.push_back(c);
+            }
+        } else if (key == "#mylist") {
+            r.title = "My List";
+            for (auto& m : app.library.items()) r.cards.push_back(Card{m});
+        } else {
+            r.title = "Recently Watched";
+            for (auto& e : app.history.recentTitles(20)) {
+                Card c;
+                c.item = itemFromEntry(e);
+                c.fromHistory = true;
+                c.entry = e;
+                r.cards.push_back(c);
+            }
+        }
+        return r;
+    }
+
+    // The home rows in the Settings > Home sections order. Catalog rows found in `keep` are reused as
+    // they are (cards, loading state), so nothing is fetched again.
+    void composeHome(App& app, std::vector<Row> keep) {
         std::vector<Row> rows;
-        Row cont;
-        cont.title = "Continue Watching";
-        cont.landscape = true;
-        cont.loaded = true;
-        for (auto& e : app.history.continueWatching(15)) {
-            Card c;
-            c.item = itemFromEntry(e);
-            c.isContinue = true;
-            c.entry = e;
-            cont.cards.push_back(c);
+        bool heroMovie = false, heroSeries = false;  // the hero comes from the first movie and series rows
+        for (auto& s : homeSections(app)) {
+            if (!s.on) continue;
+            if (s.fixed) {
+                Row r = fixedRow(app, s.key);
+                if (!r.cards.empty()) rows.push_back(std::move(r));
+                continue;
+            }
+            auto it = std::find_if(keep.begin(), keep.end(), [&](const Row& k) { return k.key == s.key; });
+            Row r;
+            if (it != keep.end()) {
+                r = std::move(*it);
+            } else {
+                r.key = s.key;
+                r.title = s.title;
+                r.loader = catalogLoader(*s.pick.addon, s.pick.info, "");
+            }
+            r.feedsHero = (s.type == "movie" && !heroMovie) || (s.type == "series" && !heroSeries);
+            if (r.feedsHero) (s.type == "movie" ? heroMovie : heroSeries) = true;
+            rows.push_back(std::move(r));
         }
-        if (!cont.cards.empty()) rows.push_back(std::move(cont));
-
-        Row mine;
-        mine.title = "My List";
-        mine.loaded = true;
-        for (auto& m : app.library.items()) mine.cards.push_back(Card{m});
-        if (!mine.cards.empty()) rows.push_back(std::move(mine));
-
-        Row recent;
-        recent.title = "Recently Watched";
-        recent.loaded = true;
-        for (auto& e : app.history.recentTitles(20)) {
-            Card c;
-            c.item = itemFromEntry(e);
-            c.entry = e;
-            recent.cards.push_back(c);
-        }
-        if (!recent.cards.empty()) rows.push_back(std::move(recent));
-        return rows;
+        pages[0].rows = std::move(rows);
     }
 
     // Progress or My List changed (back from the player): only the rows built from them change.
@@ -767,10 +852,7 @@ public:
     // while a torrent may still be using the network, left rows and artwork missing.
     void refreshFixedRows(App& app) {
         BrowsePage& p = pages[0];
-        std::vector<Row> rows = fixedRows(app);
-        for (auto& r : p.rows)
-            if (r.loader) rows.push_back(std::move(r));
-        p.rows = std::move(rows);
+        composeHome(app, std::move(p.rows));
         p.toTop();
     }
 
@@ -778,22 +860,7 @@ public:
         BrowsePage& p = pages[0];
         p.reset();
         p.emptyText = "Log in on the Account tab or add an addon to start browsing.";
-        p.rows = fixedRows(app);
-
-        // The hero comes from the first movie row and the first series row on screen.
-        bool heroMovie = false, heroSeries = false;
-        for (auto& s : homeSections(app)) {
-            if (!s.on) continue;
-            Row r;
-            r.title = s.title;
-            const std::string& type = s.type;
-            if ((type == "movie" && !heroMovie) || (type == "series" && !heroSeries)) {
-                r.feedsHero = true;
-                (type == "movie" ? heroMovie : heroSeries) = true;
-            }
-            r.loader = catalogLoader(*s.pick.addon, s.pick.info, "");
-            p.rows.push_back(std::move(r));
-        }
+        composeHome(app, {});
     }
 
     void rebuildType(App& app, BrowsePage& p, const std::string& type) {
@@ -858,6 +925,11 @@ public:
                 break;
             }
             case PageAction::OtherStreams: app.push(makeStreamsScreen(a.entry, true)); break;
+            case PageAction::Remove:
+                removeId = a.entry.metaId;
+                removeName = a.entry.name.empty() ? a.item.name : a.entry.name;
+                removeBtn = 1;
+                break;
             case PageAction::None: break;
         }
     }
@@ -893,6 +965,23 @@ public:
             }
         }
 
+        if (!removeId.empty()) {  // "Remove from your history?"
+            int tid = 0, ta = 0, tb = 0;
+            bool tap = app.tapped(tid, ta, tb) && tid == 13;
+            if (in.pressed(K_LEFT)) removeBtn = 0;
+            if (in.pressed(K_RIGHT)) removeBtn = 1;
+            if (tap) removeBtn = ta;
+            if (in.pressed(K_A) || tap) {
+                if (removeBtn == 0) {
+                    app.history.removeTitle(removeId);
+                    app.historyVersion++;
+                    app.toast("Removed " + removeName);
+                }
+                removeId.clear();
+            }
+            if (in.pressed(K_B)) removeId.clear();
+            return;
+        }
         if (in.pressed(K_PLUS)) {
             app.quit();
             return;
@@ -1440,6 +1529,24 @@ public:
         g.roundRect((int)tabX, 56, (int)tabW, 4, 2, col::accent);
     }
 
+    void drawRemoveConfirm(App& app) {
+        Gfx& g = app.gfx;
+        g.rect(0, 0, W, H, col::black.alpha(170));
+        int pw = 640, ph = 240, px = (W - pw) / 2, py = (H - ph) / 2;
+        g.roundRect(px, py, pw, ph, 20, col::bar);
+        g.roundOutline(px, py, pw, ph, 20, 1, col::white.alpha(40));
+        g.text("Remove " + removeName + "?", px + 36, py + 30, 28, col::text, pw - 72);
+        g.textWrapped("It leaves Continue Watching and Recently Watched on this Switch, with its progress. "
+                      "Watching it again brings it back.",
+                      px + 36, py + 80, 18, col::dim, pw - 72, 70);
+        int bw0 = buttonWidth(g, "Remove", IconNone), bw1 = buttonWidth(g, "Cancel", IconNone);
+        drawButton(g, px + 36, py + 160, bw0, 50, "Remove", removeBtn == 0, removeBtn == 0, IconNone);
+        drawButton(g, px + 54 + bw0, py + 160, bw1, 50, "Cancel", removeBtn == 1, false, IconNone);
+        app.hit(px + 36, py + 160, bw0, 50, 13, 0);
+        app.hit(px + 54 + bw0, py + 160, bw1, 50, 13, 1);
+        app.drawFooter("A Confirm   B Cancel");
+    }
+
     void draw(App& app) override {
         switch (tab) {
             case TAB_HOME:
@@ -1447,8 +1554,14 @@ public:
             case TAB_SERIES:
                 pageFor(tab)->draw(app);
                 drawNav(app);
-                app.drawFooter(tab == TAB_HOME ? "A Select   X Other stream   Y Details   L/R Tabs   + Exit"
-                                               : "A Select   Y Details   L/R Tabs   + Exit");
+                if (tab == TAB_HOME && !removeId.empty())
+                    drawRemoveConfirm(app);
+                else if (tab == TAB_HOME)
+                    app.drawFooter(pages[0].historyFocused()
+                                       ? "A Select   X Other stream   Y Details   - Remove   L/R Tabs   + Exit"
+                                       : "A Select   X Other stream   Y Details   L/R Tabs   + Exit");
+                else
+                    app.drawFooter("A Select   Y Details   L/R Tabs   + Exit");
                 break;
             case TAB_DISCOVER:
                 discover.draw(app);
@@ -1575,7 +1688,7 @@ public:
             app.hit(60, std::max(y, top - 6), W - 120, rowH, 90, i);
             g.text(std::to_string(i + 1), 84, y + 22, 22, col::faint);
             g.text(s.title, 130, y + 10, 22, s.on ? col::text : col::dim, 760);
-            g.text(typeLabel(s.type) + "  ·  " + s.addonName, 130, y + 40, 15, col::faint, 760);
+            g.text(s.fixed ? s.addonName : typeLabel(s.type) + "  ·  " + s.addonName, 130, y + 40, 15, col::faint, 760);
             // Up / down arrows and the on / off switch
             g.roundRect(upX, y + 20, 44, 32, 16, col::white.alpha(30));
             g.triangle(upX + 12, y + 42, upX + 32, y + 42, upX + 22, y + 30, col::text);

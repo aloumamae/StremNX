@@ -147,6 +147,7 @@ static MetaItem parseMetaItem(const Json& j) {
     m.imdbRating = j["imdbRating"].str();
     m.releaseInfo = j["releaseInfo"].str(j["year"].str());
     m.genres = genreList(j);
+    m.posterShape = j["posterShape"].str();
     return m;
 }
 

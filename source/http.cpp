@@ -2,13 +2,27 @@
 
 #include <curl/curl.h>
 
+#include <atomic>
 #include <cctype>
+#include <chrono>
 
 #include "log.hpp"
 
 static size_t writeCb(char* ptr, size_t size, size_t nmemb, void* ud) {
     static_cast<std::string*>(ud)->append(ptr, size * nmemb);
     return size * nmemb;
+}
+
+static std::atomic<int> g_foreground{0};
+static std::atomic<int64_t> g_foregroundDone{-100000};  // ms
+
+static int64_t nowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+bool httpForegroundBusy() {
+    return g_foreground > 0 || nowMs() - g_foregroundDone < 1500;  // the gap between two requests too
 }
 
 void httpInit() {
@@ -20,7 +34,18 @@ void httpCleanup() {
 }
 
 static bool perform(const std::string& url, const std::string* body, std::string& out,
-                    std::string& err, long timeoutSec) {
+                    std::string& err, long timeoutSec, bool background) {
+    struct Foreground {  // counts the request while it runs
+        bool on;
+        explicit Foreground(bool o) : on(o) {
+            if (on) g_foreground++;
+        }
+        ~Foreground() {
+            if (!on) return;
+            g_foregroundDone = nowMs();
+            g_foreground--;
+        }
+    } fg(!background);
     out.clear();
     CURL* c = curl_easy_init();
     if (!c) {
@@ -64,12 +89,12 @@ static bool perform(const std::string& url, const std::string* body, std::string
     return true;
 }
 
-bool httpGet(const std::string& url, std::string& out, std::string& err, long timeoutSec) {
-    return perform(url, nullptr, out, err, timeoutSec);
+bool httpGet(const std::string& url, std::string& out, std::string& err, long timeoutSec, bool background) {
+    return perform(url, nullptr, out, err, timeoutSec, background);
 }
 
 bool httpPostJson(const std::string& url, const std::string& body, std::string& out, std::string& err) {
-    return perform(url, &body, out, err, 30);
+    return perform(url, &body, out, err, 30, false);
 }
 
 std::string urlEncode(const std::string& s) {

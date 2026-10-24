@@ -57,6 +57,7 @@ public:
 
     void beginFrame();
     uint64_t frameCount() const { return frame; }
+    bool loadingImages() const { return !pending.empty(); }
     void pumpImages();
     void clear(Color c);
     void present();
@@ -110,7 +111,8 @@ private:
 
     std::unordered_map<int, TTF_Font*> fonts;
     std::unordered_map<std::string, Cached> textCache, imageCache;
-    std::unordered_set<std::string> pending, failed;
+    std::unordered_set<std::string> pending;
+    std::unordered_map<std::string, uint32_t> failed;  // url -> when it failed (tried again later)
     ImageLoader loader;
     uint64_t frame = 0;
     SDL_Texture* gradH = nullptr;  // 256x1, alpha 0 -> 255 left to right

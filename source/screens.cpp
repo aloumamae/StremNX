@@ -572,6 +572,7 @@ public:
         cx += chip(g, cx, cy, info.source, info.source == "Torrent" ? col::white.alpha(24) : col::success.alpha(60),
                    info.source == "Torrent" ? col::dim : col::success);
         cx += chip(g, cx, cy, info.hdr, col::gold.alpha(50), col::gold);
+        if (info.quality == "4K") cx += chip(g, cx, cy, "Heavy for Switch", col::error.alpha(40), col::error);
         cx += chip(g, cx, cy, info.size, col::white.alpha(24), col::dim);
         if (!info.seeds.empty()) chip(g, cx, cy, info.seeds + " seeds", col::white.alpha(24), col::dim);
     }

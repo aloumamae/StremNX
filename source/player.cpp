@@ -76,7 +76,8 @@ struct Observed {
     std::vector<TrackInfo> tracks;
 };
 
-enum ObsId { ObsPos = 1, ObsDur, ObsPause, ObsPausedForCache, ObsSeeking, ObsBuffer, ObsCacheTime, ObsTracks, ObsSid, ObsSubLang };
+enum ObsId { ObsPos = 1, ObsDur, ObsPause, ObsPausedForCache, ObsSeeking, ObsBuffer, ObsCacheTime, ObsTracks, ObsSid, ObsSubLang,
+             ObsHwdec, ObsCodec };  // the last two are only logged
 
 void observeAll(mpv_handle* mpv) {
     mpv_observe_property(mpv, ObsPos, "time-pos", MPV_FORMAT_DOUBLE);
@@ -89,6 +90,8 @@ void observeAll(mpv_handle* mpv) {
     mpv_observe_property(mpv, ObsTracks, "track-list", MPV_FORMAT_NODE);
     mpv_observe_property(mpv, ObsSid, "sid", MPV_FORMAT_STRING);
     mpv_observe_property(mpv, ObsSubLang, "current-tracks/sub/lang", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, ObsHwdec, "hwdec-current", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, ObsCodec, "video-format", MPV_FORMAT_STRING);
 }
 
 std::vector<TrackInfo> parseTracks(const mpv_node& list) {
@@ -443,6 +446,9 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     }
     setOpt(mpv, "vo", "libmpv");
     setOpt(mpv, "hwdec", "auto");
+    // Light scaling and HDR handling: the screen is 720p handheld / 1080p docked, so mpv's high quality
+    // downscaling and HDR peak detection cost the Tegra GPU a lot (4K and HDR stuttered) for no visible gain.
+    setOpt(mpv, "profile", "fast");
     setOpt(mpv, "cache", "yes");
     setOpt(mpv, "demuxer-max-bytes", "48MiB");
     setOpt(mpv, "demuxer-max-back-bytes", "8MiB");
@@ -885,7 +891,12 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             if (ev->event_id == MPV_EVENT_NONE) break;
             if (ev->event_id == MPV_EVENT_SHUTDOWN) quit = true;
             if (ev->event_id == MPV_EVENT_PLAYBACK_RESTART) started = true;
-            if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) applyProperty(obs, ev);
+            if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) {
+                applyProperty(obs, ev);
+                auto* p = static_cast<mpv_event_property*>(ev->data);
+                if ((ev->reply_userdata == ObsHwdec || ev->reply_userdata == ObsCodec) && p->format == MPV_FORMAT_STRING)
+                    logMsg("player: %s = %s", p->name, *(char**)p->data);  // which decoder a video really got
+            }
             if (ev->event_id == MPV_EVENT_FILE_LOADED) {
                 fileLoaded = true;
                 if (retries > 0)  // a reconnect reloaded the file: put the addon subtitles back

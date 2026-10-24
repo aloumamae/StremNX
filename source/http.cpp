@@ -29,10 +29,6 @@ void httpInit() {
     curl_global_init(CURL_GLOBAL_DEFAULT);
 }
 
-void httpCleanup() {
-    curl_global_cleanup();
-}
-
 static bool perform(const std::string& url, const std::string* body, std::string& out,
                     std::string& err, long timeoutSec, bool background) {
     struct Foreground {  // counts the request while it runs

@@ -135,6 +135,14 @@ void App::dumpSystemFont() {
 }
 
 void App::shutdown() {
+    // Torrents first: their engines finish writing and close the SD card files, so a download resumes
+    // where it stopped.
+    std::vector<std::shared_ptr<Torrent>> torrents = downloads;
+    if (activeTorrent) torrents.push_back(activeTorrent);
+    if (warm) torrents.push_back(warm);
+    for (auto& t : torrents) t->stop();
+    for (auto& t : torrents) t->waitStopped(3000);
+
     stack.clear();
     toPush.clear();
     gfx.destroy();
@@ -142,7 +150,9 @@ void App::shutdown() {
     IMG_Quit();
     TTF_Quit();
     SDL_Quit();
-    httpCleanup();
+    // curl and the sockets are left alone: threads loading artwork or catalogs, or asking trackers, can
+    // still be in the middle of a request, and tearing those down under them crashed the app on exit
+    // ("An error has occurred"). The process exit releases them.
     logClose();
 }
 

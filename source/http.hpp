@@ -3,7 +3,6 @@
 #include <string>
 
 void httpInit();
-void httpCleanup();
 
 // Return true on HTTP 2xx. On failure, `err` gets a short description.
 // background: the request is not something the viewer waits for (torrent trackers).

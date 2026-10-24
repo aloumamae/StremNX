@@ -22,6 +22,5 @@ int main(int argc, char** argv) {
 
     romfsExit();
     plExit();
-    socketExit();
-    return 0;
+    return 0;  // no socketExit(): see App::shutdown
 }

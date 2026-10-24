@@ -16,7 +16,7 @@ namespace {
 
 constexpr int kMarginX = 60;
 constexpr int kGap = 16;
-constexpr int kHeroRowsTop = 470;  // where rows start below the hero (content coordinates)
+constexpr int kHeroRowsTop = 500;  // where rows start below the hero (content coordinates)
 constexpr uint32_t kHeroInterval = 9000;
 constexpr uint32_t kHeroFadeMs = 700;
 constexpr size_t kRowLimit = 40;
@@ -35,6 +35,8 @@ struct Row {
     std::function<CatalogResult()> loader;
     Task<CatalogResult> task;
     bool started = false, loaded = false;
+    int retries = 0;  // a failed fetch (network busy, addon down) is tried again a few times
+    uint32_t retryAt = 0;
     int sel = 0;
     float scrollX = 0;
 
@@ -105,6 +107,10 @@ public:
         heroBuilt = false;
         heroIdx = 0;
         heroPrev = -1;
+        toTop();
+    }
+
+    void toTop() {
         focus = hasHero ? 0 : 1;
         heroBtn = 0;
         scrollY = 0;
@@ -118,16 +124,26 @@ public:
 
     PageAction update(App& app) {
         PageAction act;
-        int focusRow = std::max(0, focus - 1);
+        int focusRow = std::max(0, focus - 1), fixedRows = 0;  // rows with nothing to fetch
+        for (auto& r : rows) fixedRows += !r.loader;
         for (size_t i = 0; i < rows.size(); i++) {
             Row& r = rows[i];
-            if (!r.started && r.loader && (int)i <= focusRow + 3) {
+            // Rows load as they come near (rows with nothing to fetch do not count); the ones the hero
+            // is built from always load.
+            if (!r.started && r.loader && SDL_GetTicks() >= r.retryAt &&
+                ((int)i <= focusRow + 3 + fixedRows || r.feedsHero)) {
                 r.started = true;
                 auto ld = r.loader;
                 r.task.start([ld]() { return ld(); });
             }
             if (r.task.ready()) {
                 CatalogResult res = r.task.take();
+                if (res.items.empty() && !res.err.empty() && r.retries < 4) {  // again in 3, 6, 12, 24 s
+                    logMsg("home: %s failed (%s), retrying", r.title.c_str(), res.err.c_str());
+                    r.started = false;
+                    r.retryAt = SDL_GetTicks() + (3000u << r.retries++);
+                    continue;
+                }
                 for (auto& it : res.items) r.cards.push_back(Card{it});
                 r.loaded = true;
             }
@@ -424,52 +440,6 @@ std::string typeLabel(const std::string& type) {
     return type == "series" ? "Series" : "Movies";
 }
 
-void addRecommendations(App& app, BrowsePage& p, const std::string& onlyType) {
-    std::set<std::string> watched;
-    for (auto& id : app.history.metaIds()) watched.insert(id);
-
-    // "Because you watched X" for the latest two titles
-    int added = 0;
-    std::set<std::string> usedGenres;
-    for (auto& e : app.history.recentTitles(6)) {
-        if (added >= 2) break;
-        if (!onlyType.empty() && e.type != onlyType) continue;
-        for (auto& gname : e.genres) {
-            if (usedGenres.count(gname)) continue;
-            CatalogPick pick = genreCatalog(app.addons, e.type, gname);
-            if (!pick) continue;
-            Row r;
-            r.title = "Because you watched " + e.name;
-            r.loader = catalogLoader(*pick.addon, pick.info, "genre=" + urlEncode(gname), watched);
-            p.rows.push_back(std::move(r));
-            usedGenres.insert(gname);
-            added++;
-            break;
-        }
-    }
-
-    // "Top picks for you": the viewer's favorite genres mixed together
-    std::string type = onlyType;
-    if (type.empty()) {
-        auto recent = app.history.recentTitles(1);
-        type = recent.empty() ? "" : recent[0].type;
-    }
-    if (type.empty()) return;
-    std::vector<std::pair<Addon, CatalogInfo>> sources;
-    std::vector<std::string> extras;
-    for (auto& gname : app.history.topGenres(type, 3)) {
-        CatalogPick pick = genreCatalog(app.addons, type, gname);
-        if (!pick) continue;
-        sources.emplace_back(*pick.addon, pick.info);
-        extras.push_back("genre=" + urlEncode(gname));
-    }
-    if (sources.empty()) return;
-    Row r;
-    r.title = onlyType.empty() ? "Top Picks for You" : "Recommended " + typeLabel(type);
-    r.loader = mixedLoader(sources, extras, watched);
-    p.rows.push_back(std::move(r));
-}
-
 const char* const kPreferredGenres[] = {"Action",   "Comedy",  "Drama",     "Thriller",    "Sci-Fi",
                                         "Animation", "Horror", "Adventure", "Crime",       "Romance",
                                         "Fantasy",  "Family",  "Mystery",   "Documentary", "Reality-TV"};
@@ -702,11 +672,9 @@ public:
         search.emptyText = "Press Y to search movies and series";
     }
 
-    void rebuildHome(App& app) {
-        BrowsePage& p = pages[0];
-        p.reset();
-        p.emptyText = "Log in on the Account tab or add an addon to start browsing.";
-
+    // Continue Watching, My List and Recently Watched: built from local data, nothing to fetch.
+    std::vector<Row> fixedRows(App& app) {
+        std::vector<Row> rows;
         Row cont;
         cont.title = "Continue Watching";
         cont.landscape = true;
@@ -718,13 +686,13 @@ public:
             c.entry = e;
             cont.cards.push_back(c);
         }
-        if (!cont.cards.empty()) p.rows.push_back(std::move(cont));
+        if (!cont.cards.empty()) rows.push_back(std::move(cont));
 
         Row mine;
         mine.title = "My List";
         mine.loaded = true;
         for (auto& m : app.library.items()) mine.cards.push_back(Card{m});
-        if (!mine.cards.empty()) p.rows.push_back(std::move(mine));
+        if (!mine.cards.empty()) rows.push_back(std::move(mine));
 
         Row recent;
         recent.title = "Recently Watched";
@@ -735,9 +703,27 @@ public:
             c.entry = e;
             recent.cards.push_back(c);
         }
-        if (!recent.cards.empty()) p.rows.push_back(std::move(recent));
+        if (!recent.cards.empty()) rows.push_back(std::move(recent));
+        return rows;
+    }
 
-        addRecommendations(app, p, "");
+    // Progress or My List changed (back from the player): only the rows built from them change.
+    // Catalog rows and the hero keep what they loaded; fetching it all again right after playback,
+    // while a torrent may still be using the network, left rows and artwork missing.
+    void refreshFixedRows(App& app) {
+        BrowsePage& p = pages[0];
+        std::vector<Row> rows = fixedRows(app);
+        for (auto& r : p.rows)
+            if (r.loader) rows.push_back(std::move(r));
+        p.rows = std::move(rows);
+        p.toTop();
+    }
+
+    void rebuildHome(App& app) {
+        BrowsePage& p = pages[0];
+        p.reset();
+        p.emptyText = "Log in on the Account tab or add an addon to start browsing.";
+        p.rows = fixedRows(app);
 
         std::set<std::string> used;
         for (const char* type : {"movie", "series"}) {
@@ -775,7 +761,6 @@ public:
             r.feedsHero = i == 0;
             r.loader = catalogLoader(*cats[i].addon, cats[i].info, "");
             p.rows.push_back(std::move(r));
-            if (i == 0) addRecommendations(app, p, type);
         }
         int genres = 0;
         for (const char* gname : kPreferredGenres) {
@@ -844,7 +829,7 @@ public:
         } else if (app.historyVersion != seenHistory || app.libraryVersion != seenLibrary) {
             seenLibrary = app.libraryVersion;
             seenHistory = app.historyVersion;
-            rebuildHome(app);  // new progress / recommendations
+            refreshFixedRows(app);
         }
         if (loginTask.ready()) {
             auto r = loginTask.take();
@@ -877,7 +862,7 @@ public:
         } else if (tab == TAB_SEARCH) {
             if (in.pressed(K_Y) || (in.pressed(K_A) && search.rows.empty()) || tid == 30) {
                 std::string q;
-                if (showKeyboard(q, "Search movies and series", query) && !q.empty()) startSearch(app, q);
+                if (showKeyboard(app, q, "Search movies and series", query) && !q.empty()) startSearch(app, q);
                 return;
             }
             handle(app, search.update(app));
@@ -908,7 +893,7 @@ public:
     // ------------------------------------------------ settings
 
     enum SettingId {
-        S_ACCOUNT, S_SAVE_SD, S_UPLOAD, S_SERVER,
+        S_ACCOUNT, S_AUTO_DOWNLOAD, S_UPLOAD, S_SERVER,
         S_PREF_QUALITY, S_PREF_SOURCE, S_AUTOPLAY, S_RESUME_STREAM,
         S_SUB_LANG, S_SUB_ADDONS, S_SUB_SIZE, S_SUB_POS, S_SUB_STYLE, S_SUB_COLOR, S_SUB_DELAY, S_SUB_STEP,
         S_ADD_ADDON, S_REMOVE_ADDONS, S_RELOAD, S_CLEAR_HISTORY,
@@ -933,7 +918,7 @@ public:
         int posIdx = std::max(0, std::min(3, (100 - c.subPos) / 5));
         return {
             {S_ACCOUNT, Action, c.authKey.empty() ? "Log in with a Stremio account" : "Log out", c.email, "Account"},
-            {S_SAVE_SD, Toggle, "Save torrents to SD card", "", "Torrents", c.saveDownloads},
+            {S_AUTO_DOWNLOAD, Toggle, "Download what I watch", "", "Torrents", c.autoDownload},
             {S_UPLOAD, Choice, "Torrent uploading",
              c.uploadMode == 0 ? "Off" : c.uploadMode == 1 ? "Limited" : "Normal", ""},
             {S_SERVER, Action, "Streaming server", c.server.empty() ? "Built-in engine" : c.server, ""},
@@ -1028,10 +1013,10 @@ public:
         if (row.kind == Choice && (in.pressed(K_LEFT) || in.pressed(K_RIGHT))) adjust(app, row.id, in.pressed(K_RIGHT) ? 1 : -1, false);
         if (row.kind == Toggle && (in.pressed(K_LEFT) || in.pressed(K_RIGHT))) {
             bool on = in.pressed(K_RIGHT);
-            if (row.id == S_SAVE_SD) app.cfg.saveDownloads = on;
             if (row.id == S_SUB_ADDONS) app.cfg.subAddons = on;
             if (row.id == S_AUTOPLAY) app.cfg.autoplayNext = on;
             if (row.id == S_RESUME_STREAM) app.cfg.resumeSavedStream = on;
+            if (row.id == S_AUTO_DOWNLOAD) app.cfg.autoDownload = on;
             app.cfg.save();
         }
         if (!in.pressed(K_A) && !tapPress) return;
@@ -1047,8 +1032,8 @@ public:
                     app.toast("Logged out");
                 } else if (!loginTask.active()) {
                     std::string email, pass;
-                    if (!showKeyboard(email, "Stremio account e-mail", c.email) || email.empty()) break;
-                    if (!showKeyboard(pass, "Password", "", true) || pass.empty()) break;
+                    if (!showKeyboard(app, email, "Stremio account e-mail", c.email) || email.empty()) break;
+                    if (!showKeyboard(app, pass, "Password", "", true) || pass.empty()) break;
                     pendingEmail = email;
                     loginTask.start([email, pass]() {
                         std::pair<std::string, std::string> r;
@@ -1058,12 +1043,6 @@ public:
                     app.toast("Logging in...");
                 }
                 break;
-            case S_SAVE_SD:
-                c.saveDownloads = !c.saveDownloads;
-                c.save();
-                app.toast(c.saveDownloads ? "Torrents you play will be saved to the SD card"
-                                          : "Torrents will only be streamed");
-                break;
             case S_AUTOPLAY:
                 c.autoplayNext = !c.autoplayNext;
                 c.save();
@@ -1072,13 +1051,19 @@ public:
                 c.resumeSavedStream = !c.resumeSavedStream;
                 c.save();
                 break;
+            case S_AUTO_DOWNLOAD:
+                c.autoDownload = !c.autoDownload;
+                c.save();
+                app.toast(c.autoDownload ? "Torrents you watch will also be saved to the SD card"
+                                         : "Torrents will only be streamed (- in the stream list downloads one)");
+                break;
             case S_SUB_ADDONS:
                 c.subAddons = !c.subAddons;
                 c.save();
                 break;
             case S_SERVER: {
                 std::string s;
-                if (showKeyboard(s, "stremio-server URL (empty = built-in engine)", c.server.empty() ? "http://" : c.server)) {
+                if (showKeyboard(app, s, "stremio-server URL (empty = built-in engine)", c.server.empty() ? "http://" : c.server)) {
                     while (!s.empty() && (s.back() == ' ' || s.back() == '/')) s.pop_back();
                     c.server = (s == "http:" || s == "http://") ? "" : s;
                     c.save();
@@ -1087,7 +1072,7 @@ public:
             }
             case S_ADD_ADDON: {
                 std::string u;
-                if (showKeyboard(u, "Addon manifest URL", "https://") && u.size() > 8) {
+                if (showKeyboard(app, u, "Addon manifest URL", "https://") && u.size() > 8) {
                     c.addons.push_back(normalizeAddonUrl(u));
                     c.save();
                     app.reloadAddons();
@@ -1200,10 +1185,11 @@ public:
                           "Normal: up to 6 people, no limit (fastest).",
                           px + 20, vy + 162, 16, col::dim, pw - 40, 80);
         } else {
-            g.textWrapped(app.cfg.saveDownloads
-                              ? "Save to SD card is on: torrents you play are downloaded completely and keep "
-                                "downloading after you stop watching. Manage them in the Downloads tab."
-                              : "Torrents play with the built-in engine. Set a streaming server only to send them "
+            g.textWrapped(app.cfg.autoDownload
+                              ? "Download what I watch is on: torrents you play are also saved completely to the SD "
+                                "card and keep downloading after you stop watching. Manage them in the Downloads tab."
+                              : "Torrents only stream, nothing is saved. To keep one on the SD card (for a trip), "
+                                "press - on it in the stream list. Set a streaming server only to send torrents "
                                 "through a PC running Stremio.",
                           px, 370, 17, col::faint, pw, 90);
         }
@@ -1278,12 +1264,18 @@ public:
             d = dls[dlSel];
         }
         if (in.pressed(K_A) || tapOpen) {
-            if (d.complete) {
-                if (fileExists(d.file))
-                    app.requestPlay(d.file, d.ctx, true);
-                else
-                    app.toast("The file is missing from the SD card");
-            } else if (app.findDownload(d.infoHash, d.fileIdx)) {
+            if (d.complete && !fileExists(d.file)) {
+                app.toast("The file is missing from the SD card");
+            } else {  // finished: the file; still downloading: what is saved plays now, peers fill the rest
+                Stream s;
+                s.addonName = "Downloads";
+                s.infoHash = d.infoHash;
+                s.fileIdx = d.fileIdx;
+                s.trackers = d.trackers;
+                playStream(app, s, d.ctx, true, false);
+            }
+        } else if (in.pressed(K_X) && !d.complete) {
+            if (app.findDownload(d.infoHash, d.fileIdx)) {
                 app.stopDownload(d.infoHash, d.fileIdx);
                 app.toast("Download paused");
             } else {
@@ -1306,8 +1298,7 @@ public:
 
         if (dls.empty()) {
             g.text("No downloads yet", W / 2, 300, 26, col::text, 0, AlignCenter);
-            g.text(app.cfg.saveDownloads ? "Play a torrent stream and it will be saved here."
-                                         : "Turn on \"Save torrents to SD card\" in Settings, then play a torrent.",
+            g.text("Press - on a torrent in the stream list (pick an episode or movie first) to download it.",
                    W / 2, 344, 20, col::dim, W - 120, AlignCenter);
             return;
         }
@@ -1431,7 +1422,7 @@ public:
                 else if (dls.empty())
                     app.drawFooter("L/R Tabs   + Exit");
                 else
-                    app.drawFooter(std::string(dls[dlSel].complete ? "A Play" : "A Pause/Resume") +
+                    app.drawFooter(std::string(dls[dlSel].complete ? "A Play" : "A Watch   X Pause/Resume") +
                                    "   Y Delete   L/R Tabs   + Exit");
                 break;
             case TAB_SETTINGS:

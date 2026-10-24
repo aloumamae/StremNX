@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <map>
 #include <set>
 
 #include "json.hpp"
@@ -117,6 +116,16 @@ const HistoryEntry* History::findVideo(const std::string& videoId) const {
     return nullptr;
 }
 
+const HistoryEntry* History::resumePoint(const PlayContext& ctx) const {
+    const HistoryEntry* h = findVideo(ctx.videoId);
+    const SavedStream& s = ctx.stream;
+    for (size_t i = 0; !h && s.valid() && i < entries.size(); i++) {
+        const SavedStream& e = entries[i].stream;
+        if (!s.url.empty() ? e.url == s.url : e.infoHash == s.infoHash && e.fileIdx == s.fileIdx) h = &entries[i];
+    }
+    return h && h->position > 30 && !h->finished() ? h : nullptr;
+}
+
 const HistoryEntry* History::latestForMeta(const std::string& metaId) const {
     const HistoryEntry* best = nullptr;
     for (auto& e : entries)
@@ -140,30 +149,6 @@ std::vector<HistoryEntry> History::continueWatching(size_t max) const {
         if (out.size() >= max) break;
         if (!e.finished() && e.position > 10) out.push_back(e);
     }
-    return out;
-}
-
-std::vector<std::string> History::topGenres(const std::string& type, size_t max) const {
-    std::map<std::string, double> score;
-    double weight = 1.0;
-    for (auto& e : recentTitles(30)) {
-        if (!type.empty() && e.type != type) continue;
-        for (auto& g : e.genres) score[g] += weight;
-        weight *= 0.85;  // older titles count less
-    }
-    std::vector<std::pair<double, std::string>> v;
-    for (auto& kv : score) v.emplace_back(kv.second, kv.first);
-    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
-    std::vector<std::string> out;
-    for (size_t i = 0; i < v.size() && i < max; i++) out.push_back(v[i].second);
-    return out;
-}
-
-std::vector<std::string> History::metaIds() const {
-    std::vector<std::string> out;
-    std::set<std::string> seen;
-    for (auto& e : entries)
-        if (seen.insert(e.metaId).second) out.push_back(e.metaId);
     return out;
 }
 

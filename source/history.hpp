@@ -43,15 +43,15 @@ public:
     void mergeAccount(const std::vector<HistoryEntry>& items);
 
     const HistoryEntry* findVideo(const std::string& videoId) const;
+    // Where to resume this video: by its id or, failing that, by the file (a title can have another
+    // id in another addon's catalog). Null when it was not started or is finished.
+    const HistoryEntry* resumePoint(const PlayContext& ctx) const;
     const HistoryEntry* latestForMeta(const std::string& metaId) const;
 
     // One entry per title, newest first, not finished.
     std::vector<HistoryEntry> continueWatching(size_t max = 20) const;
     // One entry per title, newest first.
     std::vector<HistoryEntry> recentTitles(size_t max) const;
-    // Most watched genres for a type, weighted toward recent titles.
-    std::vector<std::string> topGenres(const std::string& type, size_t max) const;
-    std::vector<std::string> metaIds() const;
     bool empty() const { return entries.empty(); }
 
 private:

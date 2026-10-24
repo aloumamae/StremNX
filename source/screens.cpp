@@ -153,7 +153,14 @@ void playStream(App& app, const Stream& s, PlayContext ctx, bool resume, bool by
         app.cfg.lastQuality = i.quality;  // learn the viewer's preferred quality
         app.cfg.save();
     }
-    std::string url = streamPlayUrl(s, app.cfg.server);
+    DownloadInfo saved;
+    bool onSd = !s.infoHash.empty() && findSavedDownload(s.infoHash, s.fileIdx, saved);
+    if (onSd && saved.complete && fileExists(saved.file)) {
+        app.requestPlay(saved.file, ctx, resume);  // already on the SD card: no peers needed
+        return;
+    }
+    // A partial download plays in the built-in engine, which reads what is already on the SD card.
+    std::string url = onSd ? "" : streamPlayUrl(s, app.cfg.server);
     if (!url.empty())
         app.requestPlay(url, ctx, resume);  // link, SD card file, or torrent through a stremio-server
     else if (!s.infoHash.empty())
@@ -207,10 +214,14 @@ class TorrentScreen : public Screen {
 
     // Leaving: a torrent being saved to the SD card keeps downloading in the background.
     void leave(App& app) {
+        if (app.activeTorrent == torrent) app.activeTorrent.reset();
         if (torrent->keepsDownloading()) {
             app.keepDownloading(torrent);
             handedOff = true;
             app.toast("Still downloading to the SD card - see the Downloads tab");
+        } else if (!handedOff) {
+            app.keepWarm(torrent);  // reopening it soon starts from what is in RAM
+            handedOff = true;
         }
         app.pop();
     }
@@ -218,14 +229,22 @@ class TorrentScreen : public Screen {
 public:
     TorrentScreen(App& app, const Stream& s, const PlayContext& c, bool r) : ctx(c), resume(r) {
         torrent = app.findDownload(s.infoHash, s.fileIdx);  // already downloading in the background?
-        if (torrent) {
-            handedOff = true;
-        } else {
+        handedOff = (bool)torrent;
+        if (!torrent) torrent = app.takeWarm(s.infoHash, s.fileIdx);  // left a few minutes ago
+        app.keepWarm(nullptr);  // any other stream kept from before is not needed now
+        if (!torrent) {
             torrent = std::make_shared<Torrent>(s.infoHash, s.trackers, s.fileIdx);
             torrent->setUploadMode(app.cfg.uploadMode);
-            if (app.cfg.saveDownloads) torrent->saveTo(DOWNLOADS_DIR, downloadInfoJson(ctx, s.trackers));
+            // Streaming only uses RAM, unless "Download what I watch" is on. A download started by hand
+            // (- in the list) plays from what is on the SD card and keeps filling its file.
+            DownloadInfo saved;
+            if (app.cfg.autoDownload || findSavedDownload(s.infoHash, s.fileIdx, saved))
+                torrent->saveTo(DOWNLOADS_DIR, downloadInfoJson(ctx, s.trackers));
             torrent->start();
         }
+        app.activeTorrent = torrent;  // the one the viewer waits for: background downloads never slow it
+        const HistoryEntry* h = app.history.resumePoint(ctx);
+        if (resume && h) torrent->prefetch(h->progress());  // the part where playback will resume
         startedAt = SDL_GetTicks();
     }
 
@@ -448,12 +467,32 @@ public:
         if (in.pressed(K_UP) && sel > 0) sel--;
         if (in.pressed(K_R)) sel = std::min(n - 1, sel + visible);
         if (in.pressed(K_L)) sel = std::max(0, sel - visible);
+        if (in.pressed(K_MINUS)) download(app, fetch.streams[view[sel]]);
         bool open = in.pressed(K_A);
         if (tap && id == 70 && a < n) sel = a, open = true;
         if (open) {
             PlayContext c = ctx;
             c.fromSaved = false;
             playStream(app, fetch.streams[view[sel]], c, resume, true);
+        }
+    }
+
+    // Saves a torrent to the SD card in the background, without playing it.
+    void download(App& app, const Stream& s) {
+        DownloadInfo saved;
+        if (s.infoHash.empty()) {
+            app.toast("Only torrent streams can be downloaded");
+        } else if (findSavedDownload(s.infoHash, s.fileIdx, saved) && saved.complete) {
+            app.toast("Already on the SD card - see the Downloads tab");
+        } else if (app.findDownload(s.infoHash, s.fileIdx)) {
+            app.toast("Already downloading - see the Downloads tab");
+        } else {
+            auto t = std::make_shared<Torrent>(s.infoHash, s.trackers, s.fileIdx);
+            t->setUploadMode(app.cfg.uploadMode);
+            t->saveTo(DOWNLOADS_DIR, downloadInfoJson(ctx, s.trackers));
+            t->start();
+            app.keepDownloading(t);
+            app.toast("Downloading to the SD card - see the Downloads tab");
         }
     }
 
@@ -508,7 +547,7 @@ public:
         g.unclip();
         if (fetch.done() && view.empty() && !fetch.streams.empty())
             g.text("No streams match these filters", W / 2, 330, 22, col::dim, 0, AlignCenter);
-        app.drawFooter("A Play   Y Quality   X Source   ZL/ZR Sort   B Back");
+        app.drawFooter("A Play   - Download   Y Quality   X Source   ZL/ZR Sort   B Back");
     }
 
     void drawStream(Gfx& g, const Stream& s, const StreamInfo& info, int y, bool sel, bool last) {

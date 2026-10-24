@@ -437,7 +437,61 @@ CatalogPick genreCatalog(const std::vector<Addon>& addons, const std::string& ty
 }
 
 std::string typeLabel(const std::string& type) {
-    return type == "series" ? "Series" : "Movies";
+    if (type == "movie") return "Movies";
+    if (type == "series") return "Series";
+    if (type == "tv") return "TV";
+    std::string t = type;  // anime, channel, other...: the addon's own word
+    if (!t.empty()) t[0] = (char)toupper((unsigned char)t[0]);
+    return t;
+}
+
+// Every type the addons publish catalogs for: movies and series first, then the rest in addon order.
+std::vector<std::string> catalogTypes(const std::vector<Addon>& addons) {
+    std::vector<std::string> types = {"movie", "series"};
+    for (auto& c : listCatalogs(addons))
+        if (std::find(types.begin(), types.end(), c.type) == types.end()) types.push_back(c.type);
+    return types;
+}
+
+struct HomeSection {
+    std::string key, title, type, addonName;
+    CatalogPick pick;  // points into App::addons: use it right away, not after a reload
+    bool on = true;
+};
+
+// The home screen's catalog rows: every catalog the addons offer, in the order picked in Settings >
+// Home sections. Ones not placed yet keep the default order (the first movie and series catalogs,
+// usually "Popular", then the rest by type). Switched-off ones come back with on = false.
+std::vector<HomeSection> homeSections(App& app) {
+    std::vector<HomeSection> out, rest;
+    std::set<std::string> used;
+    for (auto& type : catalogTypes(app.addons)) {
+        bool first = true;
+        for (auto& c : browsable(app.addons, type)) {
+            std::string key = c.addon->id + "/" + type + "/" + c.info.id;
+            if (!used.insert(key).second) continue;
+            HomeSection s;
+            s.key = key;
+            s.title = c.info.name + " " + typeLabel(type);
+            if (c.addon->id != "com.linvo.cinemeta") s.title += "  ·  " + c.addon->name;
+            s.type = type;
+            s.addonName = c.addon->name;
+            s.pick = c;
+            const auto& hidden = app.cfg.homeHidden;
+            s.on = std::find(hidden.begin(), hidden.end(), key) == hidden.end();
+            bool lead = first && (type == "movie" || type == "series");
+            (lead ? out : rest).push_back(s);
+            first = false;
+        }
+    }
+    out.insert(out.end(), rest.begin(), rest.end());
+    const auto& order = app.cfg.homeOrder;
+    auto rank = [&](const HomeSection& s) {
+        auto it = std::find(order.begin(), order.end(), s.key);
+        return it == order.end() ? order.size() : (size_t)(it - order.begin());
+    };
+    std::stable_sort(out.begin(), out.end(), [&](const HomeSection& a, const HomeSection& b) { return rank(a) < rank(b); });
+    return out;
 }
 
 const char* const kPreferredGenres[] = {"Action",   "Comedy",  "Drama",     "Thriller",    "Sci-Fi",
@@ -450,13 +504,12 @@ const char* const kPreferredGenres[] = {"Action",   "Comedy",  "Drama",     "Thr
 class DiscoverPage {
 public:
     void reset(App& app) {
-        for (int t = 0; t < 2; t++) {
-            cats[t].clear();
-            for (auto& c : listCatalogs(app.addons)) {
-                if (c.type != (t == 0 ? "movie" : "series")) continue;
-                if (c.required && c.genres.empty()) continue;  // needs something we can't offer
-                cats[t].push_back(Cat{app.addons[c.addon], c});
-            }
+        types = catalogTypes(app.addons);
+        cats.assign(types.size(), {});
+        for (auto& c : listCatalogs(app.addons)) {
+            if (c.required && c.genres.empty()) continue;  // needs something we can't offer
+            size_t t = std::find(types.begin(), types.end(), c.type) - types.begin();
+            cats[t].push_back(Cat{app.addons[c.addon], c});
         }
         typeIdx = catIdx = genreIdx = 0;
         focus = 0;
@@ -526,7 +579,7 @@ public:
         Gfx& g = app.gfx;
         // Filter chips
         const auto& list = cats[typeIdx];
-        std::string labels[3] = {std::string("Type: ") + (typeIdx == 0 ? "Movies" : "Series"),
+        std::string labels[3] = {"Type: " + typeLabel(types.empty() ? "movie" : types[typeIdx]),
                                  "Catalog: " + (list.empty() ? std::string("none") : catLabel(list[catIdx])),
                                  "Genre: " + (list.empty() ? std::string("-") : genreLabel())};
         int x = 60;
@@ -570,7 +623,8 @@ private:
         Addon addon;
         CatalogInfo info;
     };
-    std::vector<Cat> cats[2];
+    std::vector<std::string> types;  // movie, series, then whatever else the addons have
+    std::vector<std::vector<Cat>> cats;  // per type
     int typeIdx = 0, catIdx = 0, genreIdx = 0;
     int focus = 0, chip = 0, sel = 0;
     float scroll = 0;
@@ -599,7 +653,8 @@ private:
 
     void cycle(int dir) {
         if (chip == 0) {
-            typeIdx = 1 - typeIdx;
+            int n = std::max(1, (int)types.size());
+            typeIdx = (typeIdx + dir + n) % n;
             catIdx = genreIdx = 0;
         } else if (chip == 1 && !cats[typeIdx].empty()) {
             int n = (int)cats[typeIdx].size();
@@ -658,7 +713,7 @@ class HomeScreen : public Screen {
     BrowsePage search;
     std::string query;
     int tab = TAB_HOME;
-    int seenAddons = -1, seenHistory = -1, seenLibrary = -1;
+    int seenAddons = -1, seenHistory = -1, seenLibrary = -1, seenHome = 0;
     float tabX = 0, tabW = 0;  // animated underline
 
     int accSel = 0;
@@ -725,28 +780,19 @@ public:
         p.emptyText = "Log in on the Account tab or add an addon to start browsing.";
         p.rows = fixedRows(app);
 
-        std::set<std::string> used;
-        for (const char* type : {"movie", "series"}) {
-            auto cats = browsable(app.addons, type);
-            if (cats.empty()) continue;
+        // The hero comes from the first movie row and the first series row on screen.
+        bool heroMovie = false, heroSeries = false;
+        for (auto& s : homeSections(app)) {
+            if (!s.on) continue;
             Row r;
-            r.title = "Popular " + typeLabel(type);
-            r.feedsHero = true;
-            r.loader = catalogLoader(*cats[0].addon, cats[0].info, "");
-            used.insert(cats[0].addon->id + "/" + type + "/" + cats[0].info.id);
-            p.rows.push_back(std::move(r));
-        }
-        // Everything else the addons offer
-        for (const char* type : {"movie", "series"}) {
-            for (auto& c : browsable(app.addons, type)) {
-                std::string key = c.addon->id + "/" + type + "/" + c.info.id;
-                if (!used.insert(key).second) continue;
-                Row r;
-                r.title = c.info.name + " " + typeLabel(type);
-                if (c.addon->id != "com.linvo.cinemeta") r.title += "  ·  " + c.addon->name;
-                r.loader = catalogLoader(*c.addon, c.info, "");
-                p.rows.push_back(std::move(r));
+            r.title = s.title;
+            const std::string& type = s.type;
+            if ((type == "movie" && !heroMovie) || (type == "series" && !heroSeries)) {
+                r.feedsHero = true;
+                (type == "movie" ? heroMovie : heroSeries) = true;
             }
+            r.loader = catalogLoader(*s.pick.addon, s.pick.info, "");
+            p.rows.push_back(std::move(r));
         }
     }
 
@@ -826,6 +872,9 @@ public:
             rebuildType(app, pages[2], "series");
             discover.reset(app);
             if (!query.empty()) startSearch(app, query);
+        } else if (app.homeVersion != seenHome) {
+            seenHome = app.homeVersion;
+            rebuildHome(app);  // sections edited in Settings
         } else if (app.historyVersion != seenHistory || app.libraryVersion != seenLibrary) {
             seenLibrary = app.libraryVersion;
             seenHistory = app.historyVersion;
@@ -896,7 +945,7 @@ public:
         S_ACCOUNT, S_AUTO_DOWNLOAD, S_UPLOAD, S_SERVER,
         S_PREF_QUALITY, S_PREF_SOURCE, S_AUTOPLAY, S_RESUME_STREAM,
         S_SUB_LANG, S_SUB_ADDONS, S_SUB_SIZE, S_SUB_POS, S_SUB_STYLE, S_SUB_COLOR, S_SUB_DELAY, S_SUB_STEP,
-        S_ADD_ADDON, S_REMOVE_ADDONS, S_RELOAD, S_CLEAR_HISTORY,
+        S_ADD_ADDON, S_REMOVE_ADDONS, S_HOME_SECTIONS, S_RELOAD, S_CLEAR_HISTORY,
     };
     enum SettingKind { Action, Toggle, Choice };
     struct SettingRow {
@@ -938,7 +987,8 @@ public:
             {S_SUB_DELAY, Choice, "Default delay", signedSeconds(c.subDelayMs), ""},
             {S_SUB_STEP, Choice, "Timing step in the player (L / R)", signedSeconds(c.subStepMs).substr(1), ""},
             {S_ADD_ADDON, Action, "Add addon by URL", "", "Addons & data"},
-            {S_REMOVE_ADDONS, Action, "Remove addons added by URL", std::to_string(c.addons.size()), ""},
+            {S_REMOVE_ADDONS, Action, "Manage addons", std::to_string(app.addons.size()) + " active", ""},
+            {S_HOME_SECTIONS, Action, "Home sections", "Show, hide and reorder", ""},
             {S_RELOAD, Action, "Reload addons and library", "", ""},
             {S_CLEAR_HISTORY, Action, "Clear watch history", "", ""},
         };
@@ -1080,11 +1130,8 @@ public:
                 }
                 break;
             }
-            case S_REMOVE_ADDONS:
-                c.addons.clear();
-                c.save();
-                app.reloadAddons();
-                break;
+            case S_REMOVE_ADDONS: app.push(makeAddonsScreen()); break;
+            case S_HOME_SECTIONS: app.push(makeHomeSectionsScreen()); break;
             case S_RELOAD: app.reloadAddons(); break;
             case S_CLEAR_HISTORY:
                 app.history = History();
@@ -1438,4 +1485,114 @@ public:
 
 std::unique_ptr<Screen> makeHomeScreen() {
     return std::make_unique<HomeScreen>();
+}
+
+// ---------------------------------------------------------------- Settings > Home sections
+
+// Every catalog row of the home screen: switch each one on or off and move it up or down. The home
+// screen is rebuilt when leaving, so browsing here doesn't refetch anything.
+class HomeSectionsScreen : public Screen {
+    std::vector<HomeSection> list;
+    bool loaded = false, changed = false;
+    int sel = 0;
+    float scroll = 0;
+    static const int top = 140, rowH = 72, gap = 8, visible = 7;
+    static const int toggleX = W - 84 - 56, upX = W - 84 - 56 - 130, downX = W - 84 - 56 - 76;
+
+    void save(App& app) {
+        Config& c = app.cfg;
+        c.homeOrder.clear();
+        c.homeHidden.clear();
+        for (auto& s : list) {
+            c.homeOrder.push_back(s.key);
+            if (!s.on) c.homeHidden.push_back(s.key);
+        }
+        c.save();
+        changed = true;
+    }
+
+    void move(App& app, int dir) {
+        int to = sel + dir;
+        if (to < 0 || to >= (int)list.size()) return;
+        std::swap(list[sel], list[to]);
+        sel = to;
+        save(app);
+    }
+
+public:
+    void update(App& app) override {
+        if (!loaded && !app.addonsLoading()) {
+            loaded = true;
+            list = homeSections(app);
+        }
+        const Input& in = app.in;
+        int id = 0, a = 0, b = 0;
+        bool tap = app.tapped(id, a, b);
+        if (in.pressed(K_B) || (tap && id == kHitBack)) {
+            if (changed) app.homeVersion++;
+            app.pop();
+            return;
+        }
+        int n = (int)list.size();
+        if (n == 0) return;
+        if (in.pressed(K_DOWN) && sel + 1 < n) sel++;
+        if (in.pressed(K_UP) && sel > 0) sel--;
+        bool flip = in.pressed(K_A);
+        int dir = in.pressed(K_L) ? -1 : in.pressed(K_R) ? 1 : 0;
+        if (tap && a < n) {
+            if (id == 91) flip = true;            // the switch
+            if (id == 92) dir = -1;               // up arrow
+            if (id == 93) dir = 1;                // down arrow
+            if (id == 90) flip = sel == a;        // a row: first tap selects, the second switches
+            sel = a;
+        }
+        if (flip) {
+            list[sel].on = !list[sel].on;
+            save(app);
+        }
+        if (dir) move(app, dir);
+    }
+
+    void draw(App& app) override {
+        Gfx& g = app.gfx;
+        g.text("Home sections", 60, 40, 34, col::text);
+        int on = 0;
+        for (auto& s : list) on += s.on;
+        g.text(!loaded ? "Loading addons..." : std::to_string(on) + " of " + std::to_string(list.size()) + " shown", 60, 90,
+               19, col::dim);
+        drawBackButton(app);
+
+        float target = (float)std::max(0, sel - (visible - 2)) * (rowH + gap);
+        scroll = approach(scroll, target, 0.25f);
+        g.clip(0, top - 6, W, H - top - 40);
+        for (int i = 0; i < (int)list.size(); i++) {
+            int y = top + i * (rowH + gap) - (int)scroll;
+            if (y + rowH < top - 6 || y > H) continue;
+            const HomeSection& s = list[i];
+            bool f = i == sel;
+            g.roundRect(60, y, W - 120, rowH, 14, f ? col::cardSel.alpha(240) : col::card.alpha(200));
+            if (f) g.roundOutline(60, y, W - 120, rowH, 14, 2, col::accentLight);
+            app.hit(60, std::max(y, top - 6), W - 120, rowH, 90, i);
+            g.text(std::to_string(i + 1), 84, y + 22, 22, col::faint);
+            g.text(s.title, 130, y + 10, 22, s.on ? col::text : col::dim, 760);
+            g.text(typeLabel(s.type) + "  ·  " + s.addonName, 130, y + 40, 15, col::faint, 760);
+            // Up / down arrows and the on / off switch
+            g.roundRect(upX, y + 20, 44, 32, 16, col::white.alpha(30));
+            g.triangle(upX + 12, y + 42, upX + 32, y + 42, upX + 22, y + 30, col::text);
+            app.hit(upX, y + 16, 44, 40, 92, i);
+            g.roundRect(downX, y + 20, 44, 32, 16, col::white.alpha(30));
+            g.triangle(downX + 12, y + 30, downX + 32, y + 30, downX + 22, y + 42, col::text);
+            app.hit(downX, y + 16, 44, 40, 93, i);
+            g.roundRect(toggleX, y + 22, 56, 28, 14, s.on ? col::accent : col::white.alpha(50));
+            g.circle(toggleX + (s.on ? 42.0f : 14.0f), y + 36.0f, 11, col::white);
+            app.hit(toggleX - 8, y + 12, 72, 48, 91, i);
+        }
+        g.unclip();
+        if (loaded && list.empty()) g.text("No catalogs: add an addon with catalogs", W / 2, 300, 22, col::dim, 0, AlignCenter);
+        app.drawFooter("A Show / hide   L/R Move up / down   B Back");
+    }
+};
+
+std::unique_ptr<Screen> makeHomeSectionsScreen() {
+    return std::make_unique<HomeSectionsScreen>();
 }

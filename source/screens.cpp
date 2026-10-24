@@ -708,7 +708,197 @@ public:
     }
 };
 
+// ---------------------------------------------------------------- Addons
+
+// Every addon, one by one, those that failed to load included. Each one switches on or off right away
+// (on this Switch only: the Stremio account is not changed). Addons added by URL can also be removed.
+class AddonsScreen : public Screen {
+    struct Entry {
+        std::string url, name;
+        enum Kind { ByUrl, Account, BuiltIn } kind = Account;
+        bool loaded = false, off = false;
+    };
+    std::vector<Entry> list;
+    int sel = 0, confirm = -1, confirmBtn = 1;  // confirm: entry waiting for "Remove?"
+    float scroll = 0;
+    int seenVersion = -1;
+    static const int top = 140, rowH = 78, gap = 10, visible = 6;
+    static const int toggleX = W - 84 - 56, removeX = 700;  // row controls (touch / pointer)
+
+    static std::string hostOf(const std::string& url) {
+        size_t a = url.find("://");
+        a = a == std::string::npos ? 0 : a + 3;
+        return url.substr(a, url.find('/', a) - a);
+    }
+
+    void build(App& app) {
+        const Config& c = app.cfg;
+        auto builtIn = [](const std::string& u) { return u == CINEMETA_URL || u == OPENSUBTITLES_URL; };
+        auto off = [&](const std::string& u) {
+            return std::find(c.disabledAddons.begin(), c.disabledAddons.end(), u) != c.disabledAddons.end();
+        };
+        auto add = [&](const std::string& url, const std::string& name, bool loaded) {
+            for (auto& e : list)
+                if (e.url == url) return;
+            Entry e;
+            e.url = url;
+            e.name = name.empty() ? hostOf(url) : name;
+            bool byUrl = std::find(c.addons.begin(), c.addons.end(), url) != c.addons.end();
+            e.kind = byUrl ? Entry::ByUrl : builtIn(url) ? Entry::BuiltIn : Entry::Account;
+            e.loaded = loaded;
+            e.off = off(url);
+            list.push_back(e);
+        };
+        list.clear();
+        for (auto& a : app.addons) add(a.transportUrl, a.name, true);
+        for (auto& u : c.addons) add(u, "", false);  // added by URL but not loaded: off, or it failed
+        for (auto& u : c.disabledAddons) add(u, "", false);
+        sel = std::max(0, std::min(sel, (int)list.size() - 1));
+    }
+
+    void toggle(App& app, int i) {
+        Config& c = app.cfg;
+        Entry& e = list[i];
+        e.off = !e.off;
+        auto& d = c.disabledAddons;
+        if (e.off)
+            d.push_back(e.url);
+        else
+            d.erase(std::remove(d.begin(), d.end(), e.url), d.end());
+        app.toast(e.name + (e.off ? " is off" : " is on"));
+        c.save();
+        app.reloadAddons();
+    }
+
+    void remove(App& app, int i) {
+        Config& c = app.cfg;
+        Entry& e = list[i];
+        c.addons.erase(std::remove(c.addons.begin(), c.addons.end(), e.url), c.addons.end());
+        c.disabledAddons.erase(std::remove(c.disabledAddons.begin(), c.disabledAddons.end(), e.url),
+                               c.disabledAddons.end());
+        app.toast("Removed " + e.name);
+        list.erase(list.begin() + i);
+        sel = std::max(0, std::min(sel, (int)list.size() - 1));
+        c.save();
+        app.reloadAddons();
+    }
+
+public:
+    void update(App& app) override {
+        if (seenVersion != app.addonsVersion) {  // first open, or a reload finished
+            seenVersion = app.addonsVersion;
+            build(app);
+        }
+        const Input& in = app.in;
+        int id = 0, a = 0, b = 0;
+        bool tap = app.tapped(id, a, b);
+        if (confirm >= 0) {
+            if (in.pressed(K_LEFT)) confirmBtn = 0;
+            if (in.pressed(K_RIGHT)) confirmBtn = 1;
+            if (tap && id == 81) confirmBtn = a;
+            if (in.pressed(K_A) || (tap && id == 81)) {
+                if (confirmBtn == 0) remove(app, confirm);
+                confirm = -1;
+            }
+            if (in.pressed(K_B)) confirm = -1;
+            return;
+        }
+        if (in.pressed(K_B) || (tap && id == kHitBack)) {
+            app.pop();
+            return;
+        }
+        int n = (int)list.size();
+        if (n == 0) return;
+        if (in.pressed(K_DOWN) && sel + 1 < n) sel++;
+        if (in.pressed(K_UP) && sel > 0) sel--;
+        bool flip = in.pressed(K_A), drop = in.pressed(K_Y);
+        if (tap && a < n) {
+            if (id == 82) flip = true;  // the switch itself
+            if (id == 83) drop = true;  // the Remove button
+            if (id == 80) flip = sel == a;  // a row: first tap selects, the second switches
+            sel = a;
+        }
+        if (flip) toggle(app, sel);
+        if (drop && list[sel].kind == Entry::ByUrl) {
+            confirm = sel;
+            confirmBtn = 1;
+        }
+    }
+
+    void draw(App& app) override {
+        Gfx& g = app.gfx;
+        g.text("Addons", 60, 40, 34, col::text);
+        int on = 0;
+        for (auto& e : list) on += !e.off;
+        g.text(app.addonsLoading() ? "Updating..."
+                                   : std::to_string(on) + " on, " + std::to_string(list.size() - on) + " off",
+               60, 90, 19, col::dim);
+        drawBackButton(app);
+
+        float target = (float)std::max(0, sel - (visible - 2)) * (rowH + gap);
+        scroll = approach(scroll, target, 0.25f);
+        g.clip(0, top - 6, W, H - top - 40);
+        for (int i = 0; i < (int)list.size(); i++) {
+            int y = top + i * (rowH + gap) - (int)scroll;
+            if (y + rowH < top - 6 || y > H) continue;
+            const Entry& e = list[i];
+            bool s = i == sel;
+            g.roundRect(60, y, W - 120, rowH, 14, s ? col::cardSel.alpha(240) : col::card.alpha(200));
+            if (s) g.roundOutline(60, y, W - 120, rowH, 14, 2, col::accentLight);
+            app.hit(60, std::max(y, top - 6), W - 120, rowH, 80, i);
+            g.text(e.name, 84, y + 12, 22, e.off ? col::dim : col::text, 440);
+            auto why = app.addonErrors.find(e.url);  // a failed one shows the reason instead of its URL
+            bool showWhy = !e.loaded && !e.off && why != app.addonErrors.end();
+            g.text(showWhy ? why->second : e.url, 84, y + 44, 15, showWhy ? col::error : col::faint, 440);
+            const char* kind = e.kind == Entry::ByUrl ? "Added by URL" : e.kind == Entry::BuiltIn ? "Built-in" : "Account";
+            chip(g, 548, y + 26, kind, col::white.alpha(24), col::dim);
+            if (e.kind == Entry::ByUrl) {  // Remove (Y)
+                g.roundRect(removeX, y + 22, 96, 34, 17, col::white.alpha(30));
+                g.text("Remove", removeX + 48, y + 28, 17, col::text, 0, AlignCenter);
+                app.hit(removeX, y + 22, 96, 34, 83, i);
+            }
+            bool failed = !e.loaded && !e.off && !app.addonsLoading();
+            if (failed) g.text("Failed to load", toggleX - 20, y + 28, 18, col::error, 0, AlignRight);
+            // On / off switch
+            g.roundRect(toggleX, y + 25, 56, 28, 14, e.off ? col::white.alpha(50) : col::accent);
+            g.circle(toggleX + (e.off ? 14.0f : 42.0f), y + 39.0f, 11, col::white);
+            app.hit(toggleX - 8, y + 15, 72, 48, 82, i);
+        }
+        g.unclip();
+        if (list.empty()) g.text("No addons", W / 2, 300, 24, col::dim, 0, AlignCenter);
+
+        if (confirm >= 0 && confirm < (int)list.size()) {
+            const Entry& e = list[confirm];
+            g.rect(0, 0, W, H, col::black.alpha(170));
+            int pw = 640, ph = 240, px = (W - pw) / 2, py = (H - ph) / 2;
+            g.roundRect(px, py, pw, ph, 20, col::bar);
+            g.roundOutline(px, py, pw, ph, 20, 1, col::white.alpha(40));
+            g.text("Remove " + e.name + "?", px + 36, py + 30, 28, col::text, pw - 72);
+            g.textWrapped("It is removed from this Switch. You can add it again by URL. To keep it but not use it, "
+                          "switch it off instead.",
+                          px + 36, py + 80, 18, col::dim, pw - 72, 70);
+            int bw0 = buttonWidth(g, "Remove", IconNone), bw1 = buttonWidth(g, "Cancel", IconNone);
+            drawButton(g, px + 36, py + 160, bw0, 50, "Remove", confirmBtn == 0, confirmBtn == 0, IconNone);
+            drawButton(g, px + 54 + bw0, py + 160, bw1, 50, "Cancel", confirmBtn == 1, false, IconNone);
+            app.hit(px + 36, py + 160, bw0, 50, 81, 0);
+            app.hit(px + 54 + bw0, py + 160, bw1, 50, 81, 1);
+            app.drawFooter("A Confirm   B Cancel");
+        } else if (!list.empty()) {
+            const Entry& e = list[sel];
+            std::string hints = std::string(e.off ? "A Turn on" : "A Turn off") +
+                                (e.kind == Entry::ByUrl ? "   Y Remove" : "") + "   B Back";
+            app.drawFooter(hints);
+        } else {
+            app.drawFooter("B Back");
+        }
+    }
+};
+
 }  // namespace
+
+std::unique_ptr<Screen> makeAddonsScreen() {
+    return std::make_unique<AddonsScreen>();
+}
 
 std::unique_ptr<Screen> makeStreamsScreen(const PlayContext& ctx, bool resume) {
     return std::make_unique<StreamsScreen>(ctx, resume);

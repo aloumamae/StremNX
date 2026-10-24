@@ -21,6 +21,9 @@ struct Config {
     std::string authKey, email;
     std::string server;               // stremio-server for torrents, e.g. http://192.168.0.10:11470
     std::vector<std::string> addons;  // extra addons added by URL
+    std::vector<std::string> disabledAddons;  // addons switched off on this Switch (any kind)
+    // Home sections (catalog keys "addonId/type/catalogId"): the order picked and the ones switched off.
+    std::vector<std::string> homeOrder, homeHidden;
     bool autoDownload = false;        // save every torrent played to the SD card (off: only by hand)
     int uploadMode = 1;               // torrent uploading: 0 off, 1 limited, 2 normal
     // Subtitles
@@ -57,6 +60,7 @@ std::unique_ptr<Screen> makeHomeScreen();
 struct AddonsResult {
     std::vector<Addon> addons;
     std::vector<std::string> errors;
+    std::map<std::string, std::string> failed;  // addon URL -> why it did not load
     std::vector<HistoryEntry> library;  // account progress, when logged in
     bool accountOk = false;             // datastore read worked
     Json accountItems;                  // raw account library items
@@ -120,6 +124,8 @@ public:
 
     std::vector<Addon> addons;
     int addonsVersion = 0;   // bumped whenever the addon list changes
+    int homeVersion = 0;     // bumped when the home sections are edited
+    std::map<std::string, std::string> addonErrors;  // addon URL -> why it did not load (last reload)
     int historyVersion = 0;  // bumped whenever the watch history changes
     bool addonsLoading() const { return addonsTask.active(); }
 

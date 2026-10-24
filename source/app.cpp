@@ -47,7 +47,14 @@ void Config::load() {
     server = j["server"].str();
     addons.clear();
     for (auto& a : j["addons"].items())
-        if (!a.str().empty()) addons.push_back(a.str());
+        if (!a.str().empty()) addons.push_back(normalizeAddonUrl(a.str()));  // fixes ones saved before
+    disabledAddons.clear();
+    for (auto& a : j["disabledAddons"].items())
+        if (!a.str().empty()) disabledAddons.push_back(a.str());
+    homeOrder.clear();
+    for (auto& a : j["homeOrder"].items()) homeOrder.push_back(a.str());
+    homeHidden.clear();
+    for (auto& a : j["homeHidden"].items()) homeHidden.push_back(a.str());
 }
 
 void Config::save() const {
@@ -61,6 +68,13 @@ void Config::save() const {
     Json arr = Json::array();
     for (auto& a : addons) arr.push(a);
     j.set("addons", arr);
+    Json disabled = Json::array();
+    for (auto& a : disabledAddons) disabled.push(a);
+    j.set("disabledAddons", disabled);
+    Json order = Json::array(), off = Json::array();
+    for (auto& k : homeOrder) order.push(k);
+    for (auto& k : homeHidden) off.push(k);
+    j.set("homeOrder", order).set("homeHidden", off);
     std::string text = j.dump();
     if (!writeFile(kConfigPath, text.data(), text.size())) logMsg("failed to save config");
 }
@@ -331,6 +345,7 @@ void App::reloadAddons() {
         for (auto& e : entries) {
             std::string url = normalizeAddonUrl(e.url);
             if (!seen.insert(url).second) continue;
+            if (std::find(c.disabledAddons.begin(), c.disabledAddons.end(), url) != c.disabledAddons.end()) continue;
             Addon a;
             std::string err;
             if (addonFromManifest(url, e.manifest, a) || withRetries([&] { return fetchManifest(url, a, err); })) {
@@ -338,6 +353,7 @@ void App::reloadAddons() {
                 res.addons.push_back(a);
             } else {
                 res.errors.push_back(url + ": " + err);
+                res.failed[url] = err;
             }
         }
         return res;
@@ -417,6 +433,7 @@ void App::run() {
         if (addonsTask.ready()) {
             AddonsResult res = addonsTask.take();
             addons = std::move(res.addons);
+            addonErrors = std::move(res.failed);
             addonsVersion++;
             if (!res.library.empty()) {
                 history.mergeAccount(res.library);

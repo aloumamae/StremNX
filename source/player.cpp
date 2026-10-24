@@ -27,6 +27,7 @@ void* getProcAddress(void*, const char* name) {
 
 SDL_GLContext createContext(SDL_Window* win) {
     SDL_GL_ResetAttributes();
+    requestColorDepth();
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
@@ -77,7 +78,8 @@ struct Observed {
 };
 
 enum ObsId { ObsPos = 1, ObsDur, ObsPause, ObsPausedForCache, ObsSeeking, ObsBuffer, ObsCacheTime, ObsTracks, ObsSid, ObsSubLang,
-             ObsHwdec, ObsCodec };  // the last two are only logged
+             ObsHwdec, ObsCodec,      // only logged
+             ObsWidth, ObsGamma };    // pick light rendering for heavy videos
 
 void observeAll(mpv_handle* mpv) {
     mpv_observe_property(mpv, ObsPos, "time-pos", MPV_FORMAT_DOUBLE);
@@ -92,6 +94,8 @@ void observeAll(mpv_handle* mpv) {
     mpv_observe_property(mpv, ObsSubLang, "current-tracks/sub/lang", MPV_FORMAT_STRING);
     mpv_observe_property(mpv, ObsHwdec, "hwdec-current", MPV_FORMAT_STRING);
     mpv_observe_property(mpv, ObsCodec, "video-format", MPV_FORMAT_STRING);
+    mpv_observe_property(mpv, ObsWidth, "video-params/w", MPV_FORMAT_INT64);
+    mpv_observe_property(mpv, ObsGamma, "video-params/gamma", MPV_FORMAT_STRING);
 }
 
 std::vector<TrackInfo> parseTracks(const mpv_node& list) {
@@ -437,6 +441,14 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     }
     SDL_GL_MakeCurrent(win, gl);
     SDL_GL_SetSwapInterval(1);
+    // mpv dithers for the framebuffer's color depth: tell it what the system really gave us.
+    int rb = 0, gb = 0, bb = 0;
+    SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &rb);
+    SDL_GL_GetAttribute(SDL_GL_GREEN_SIZE, &gb);
+    SDL_GL_GetAttribute(SDL_GL_BLUE_SIZE, &bb);
+    int fbDepth = std::min({rb, gb, bb});
+    logMsg("player: framebuffer %d/%d/%d bits", rb, gb, bb);
+    if (fbDepth <= 0) fbDepth = 8;
 
     mpv_handle* mpv = mpv_create();
     if (!mpv) {
@@ -446,9 +458,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     }
     setOpt(mpv, "vo", "libmpv");
     setOpt(mpv, "hwdec", "auto");
-    // Light scaling and HDR handling: the screen is 720p handheld / 1080p docked, so mpv's high quality
-    // downscaling and HDR peak detection cost the Tegra GPU a lot (4K and HDR stuttered) for no visible gain.
-    setOpt(mpv, "profile", "fast");
+    setOpt(mpv, "dither", app.cfg.dither ? "fruit" : "no");  // see Config::dither
     setOpt(mpv, "cache", "yes");
     setOpt(mpv, "demuxer-max-bytes", "48MiB");
     setOpt(mpv, "demuxer-max-back-bytes", "8MiB");
@@ -538,6 +548,9 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         if (!cands.empty()) subsTask.start([cands, type, vid, code]() { return fetchAddonSubs(cands, type, vid, code); });
     }
     bool fileLoaded = false;
+    int64_t videoW = 0;  // video width and transfer (pq / hlg = HDR), to spot heavy videos
+    std::string videoGamma;
+    bool lightRendering = false;
     Observed obs;
     observeAll(mpv);
     double subDelay = cfg.subDelayMs / 1000.0, subScale = cfg.subSize / 100.0;
@@ -615,7 +628,8 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
             case 0: snprintf(b, sizeof(b), "Speed: %gx", speeds[speedIdx]); return b;
             case 1: return std::string("Aspect: ") + aspects[aspectIdx];
             case 2: return std::string("Zoom: ") + zoomNames[zoomIdx];
-            default: snprintf(b, sizeof(b), "Volume: %d%%", volumes[volumeIdx]); return b;
+            case 3: snprintf(b, sizeof(b), "Volume: %d%%", volumes[volumeIdx]); return b;
+            default: return std::string("Dithering: ") + (app.cfg.dither ? "On" : "Off");
         }
     };
 
@@ -646,6 +660,11 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                 setAsync(mpv, "volume", v);
                 break;
             }
+            case 4:  // live, to compare on the same scene: dithering hides banding but can speckle dark areas
+                app.cfg.dither = !app.cfg.dither;
+                app.cfg.save();
+                setAsync(mpv, "dither", app.cfg.dither ? "fruit" : "no");
+                break;
         }
     };
 
@@ -674,7 +693,7 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
     const float colX[3] = {130, 520, 910};
     auto menuItemY = [](int i, int first) { return 210.0f + (i - first) * 44; };
     auto menuFirst = [&](int c) { return std::max(0, menuSel[c] - 8); };
-    auto menuCount = [&](int c) { return c == 0 ? (int)audio.size() : c == 1 ? (int)subs.size() : 4; };
+    auto menuCount = [&](int c) { return c == 0 ? (int)audio.size() : c == 1 ? (int)subs.size() : 5; };
 
     // Watching over the network comes first: background downloads wait (not when playing from the SD card).
     bool fromSd = url.compare(0, 5, "sdmc:") == 0;
@@ -896,6 +915,16 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
                 auto* p = static_cast<mpv_event_property*>(ev->data);
                 if ((ev->reply_userdata == ObsHwdec || ev->reply_userdata == ObsCodec) && p->format == MPV_FORMAT_STRING)
                     logMsg("player: %s = %s", p->name, *(char**)p->data);  // which decoder a video really got
+                if (ev->reply_userdata == ObsWidth && p->format == MPV_FORMAT_INT64) videoW = *(int64_t*)p->data;
+                if (ev->reply_userdata == ObsGamma && p->format == MPV_FORMAT_STRING) videoGamma = *(char**)p->data;
+                // 4K or HDR only: light scaling and HDR handling. mpv's high quality downscaling and HDR peak
+                // detection made those stutter on the Tegra GPU, but on everything else (1080p is downscaled
+                // too in handheld) the light filters make film grain and fine texture look noisy.
+                if (!lightRendering && (videoW > 2560 || videoGamma == "pq" || videoGamma == "hlg")) {
+                    lightRendering = true;
+                    command(mpv, "apply-profile", "fast");
+                    logMsg("player: heavy video (%lld px wide, %s): light rendering", (long long)videoW, videoGamma.c_str());
+                }
             }
             if (ev->event_id == MPV_EVENT_FILE_LOADED) {
                 fileLoaded = true;
@@ -1121,8 +1150,10 @@ PlayResult runPlayer(App& app, const std::string& url, const PlayContext& ctx, d
         mpv_render_param rp[] = {
             {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
             {MPV_RENDER_PARAM_FLIP_Y, &flipY},
+            {MPV_RENDER_PARAM_DEPTH, &fbDepth},
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
+        disableGlDither();  // every frame: mpv owns the GL state while it renders
         mpv_render_context_render(rctx, rp);
         if (pointing) drawPointerGl((float)ptrX, (float)ptrY, w, h);
         watchBeat(WatchMain, "player: swap");

@@ -37,6 +37,7 @@ void Config::load() {
     subDelayMs = (int)j["subDelayMs"].num(0);
     subStepMs = (int)j["subStepMs"].num(100);
     volume = (int)j["volume"].num(100);
+    dither = j["dither"].boolean(false);
     prefQuality = j["prefQuality"].str("auto");
     lastQuality = j["lastQuality"].str();
     preferSource = (int)j["preferSource"].num(0);
@@ -65,6 +66,7 @@ void Config::save() const {
     j.set("subStyle", subStyle).set("subColor", subColor).set("subDelayMs", subDelayMs).set("subStepMs", subStepMs);
     j.set("prefQuality", prefQuality).set("lastQuality", lastQuality).set("preferSource", preferSource);
     j.set("autoplayNext", autoplayNext).set("resumeSavedStream", resumeSavedStream).set("volume", volume);
+    j.set("dither", dither);
     Json arr = Json::array();
     for (auto& a : addons) arr.push(a);
     j.set("addons", arr);
@@ -114,6 +116,7 @@ bool App::init() {
         return false;
     }
     logMsg("init: SDL ok");
+    requestColorDepth();
     win = SDL_CreateWindow("StremNX", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_W, SCREEN_H,
                            SDL_WINDOW_OPENGL);
     if (!win) {

@@ -115,6 +115,7 @@ void Gfx::makeGradients() {
 
 bool Gfx::restoreRenderer() {
     SDL_GL_ResetAttributes();
+    requestColorDepth();
     r = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!r) {
         logMsg("SDL_CreateRenderer failed: %s", SDL_GetError());
@@ -122,6 +123,12 @@ bool Gfx::restoreRenderer() {
     }
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+    disableGlDither();  // the renderer's GL context is current now
+    int rb = 0, gb = 0, bb = 0;
+    SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &rb);
+    SDL_GL_GetAttribute(SDL_GL_GREEN_SIZE, &gb);
+    SDL_GL_GetAttribute(SDL_GL_BLUE_SIZE, &bb);
+    logMsg("ui: framebuffer %d/%d/%d bits", rb, gb, bb);
     makeGradients();
     return true;
 }

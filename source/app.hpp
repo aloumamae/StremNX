@@ -42,6 +42,9 @@ struct Config {
     bool autoplayNext = true;          // play the next episode at the end
     bool resumeSavedStream = true;     // Continue watching reuses the stream picked before
     int volume = 100;                  // player volume in percent (the last one picked in the player)
+    // mpv dithering: off by default. Its noise pattern is fixed on screen, per color channel, and on the
+    // OLED panel it shows as a still film of red and green specks over dark scenes.
+    bool dither = false;
     void load();
     void save() const;
 };

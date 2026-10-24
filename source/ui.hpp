@@ -10,6 +10,22 @@
 #include <unordered_map>
 #include <unordered_set>
 
+// 8 bits per color for the window and every GL context. SDL's minimum is 3/3/2, so the system could hand
+// out a 16-bit surface: mpv then dithered heavily for 5-6 bit color, which shows as grain in dark scenes.
+inline void requestColorDepth() {
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+}
+
+// GL_DITHER is on by default in OpenGL: below 8 bits per color the GPU dithers everything drawn with a
+// fixed per-channel pattern, a still film of red / green specks over dark areas. Off: at worst banding.
+// Call with the context current.
+inline void disableGlDither() {
+    using Cap = void (*)(unsigned);
+    if (auto off = (Cap)SDL_GL_GetProcAddress("glDisable")) off(0x0BD0);  // GL_DITHER
+}
+
 struct Color {
     Uint8 r, g, b, a;
     Color alpha(Uint8 na) const { return Color{r, g, b, na}; }

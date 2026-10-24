@@ -30,6 +30,10 @@ namespace {
 
 constexpr int kBlock = 16 * 1024;
 constexpr size_t kMaxPeers = 55;
+constexpr size_t kBackgroundPeers = 25;  // a download nobody watches needs fewer connections
+// Socket memory is one pool for the whole app: peer sockets get small fixed buffers instead of growing
+// to 256 KB each, or a busy download left none for the app's own requests ("Couldn't connect").
+constexpr int kPeerRecvBuf = 64 * 1024, kPeerSendBuf = 32 * 1024;
 // Most peers trackers hand out are stale and never answer, so attempts must be many and short:
 // a live peer answers a SYN well under a second. Raise kMaxConnecting if the log shows a long queue.
 constexpr int kMaxConnecting = 30;
@@ -407,8 +411,10 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
     }
 
     void connectMore(uint64_t now) {
+        if (yielding) return;  // the app needs the network now: no new connections either
+        size_t maxPeers = watched ? kMaxPeers : kBackgroundPeers;
         int connecting = countState(0);
-        while (connecting < kMaxConnecting && peers.size() < kMaxPeers && !candidates.empty()) {
+        while (connecting < kMaxConnecting && peers.size() < maxPeers && !candidates.empty()) {
             Endpoint e = candidates.front();
             candidates.pop_front();
             if (attempts[e]++ >= 2) continue;
@@ -422,6 +428,8 @@ struct Torrent::Impl : std::enable_shared_from_this<Torrent::Impl> {
             int fd = socket(AF_INET, SOCK_STREAM, 0);
             if (fd < 0) break;
             fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &kPeerRecvBuf, sizeof(kPeerRecvBuf));
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &kPeerSendBuf, sizeof(kPeerSendBuf));
             sockaddr_in a{};
             a.sin_family = AF_INET;
             a.sin_port = htons(e.port);

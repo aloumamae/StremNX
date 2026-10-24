@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <thread>
 
 #include "log.hpp"
 
@@ -66,7 +67,15 @@ static bool perform(const std::string& url, const std::string* body, std::string
         curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body->size());
     }
 
-    CURLcode rc = curl_easy_perform(c);
+    CURLcode rc;
+    for (int attempt = 0;; attempt++) {
+        rc = curl_easy_perform(c);
+        // A failed connect is often momentary (socket memory busy with torrent peers that are just
+        // stepping aside, Wi-Fi waking up): try again before reporting it.
+        if (rc != CURLE_COULDNT_CONNECT || attempt == 2) break;
+        out.clear();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
     long code = 0;
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
     curl_slist_free_all(headers);
